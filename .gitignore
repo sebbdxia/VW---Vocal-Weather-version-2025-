@@ -1,0 +1,24 @@
+# Environnement virtuel
+.venv/
+venv/
+env/
+ENV/
+.venv/Scripts/
+.venv/Lib/
+
+# Fichiers de configuration
+*.env
+
+# Fichiers de cache
+__pycache__/
+*.py[cod]
+
+# Fichiers de log
+*.log
+
+# Fichiers de base de données
+*.sqlite3
+
+# Fichiers de l'IDE
+.vscode/
+.idea/
