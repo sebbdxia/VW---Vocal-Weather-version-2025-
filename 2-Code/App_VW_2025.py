@@ -49,9 +49,9 @@ def extract_location_and_date(text):
     
     for ent in doc.ents:
         print(f"Entity found: {ent.text} ({ent.label_})")
-        if ent.label_ == "LOC":
+        if (ent.label_ == "LOC"):
             location = ent.text
-        if ent.label_ in ["DATE", "TIME"]:
+        if (ent.label_ in ["DATE", "TIME"]):
             date = ent.text
     
     location = location or "Non spécifié"
@@ -66,7 +66,7 @@ async def get_weather(city):
         response = await client.get(url)
         # Debug: Vérifier la réponse de l'API
         print(f"API Response: {response.status_code} - {response.text}")
-        if response.status_code == 200:
+        if (response.status_code == 200):
             data = response.json()
             print(f"Weather data: {data}")
             return {
@@ -84,7 +84,7 @@ async def meteo(ville: str):
     return await get_weather(ville)
 
 # Interface utilisateur avec Streamlit
-def streamlit_interface():
+async def streamlit_interface():
     st.title("Assistant Météo Vocal")
     
     if st.button("Parlez"):
@@ -92,7 +92,7 @@ def streamlit_interface():
         if text:
             location, date = extract_location_and_date(text)
             try:
-                meteo_data = get_weather(location)
+                meteo_data = await get_weather(location)  # Ajout de await pour l'appel asynchrone
                 st.write(f"Prévisions météo pour {location} ({date}) :")
                 st.write(f"- {meteo_data['description']}")
                 st.write(f"- Température : {meteo_data['temperature']}°C")
@@ -100,10 +100,13 @@ def streamlit_interface():
                 st.write(f"- Vent : {meteo_data['wind_speed']} km/h")
             except HTTPException as e:
                 st.error("Ville introuvable")
+            except Exception as e:
+                st.error(f"Erreur: {str(e)}")  # Ajout de la gestion des exceptions
 
 # Déploiement sécurisé avec Uvicorn
 if __name__ == "__main__":
     import threading
+    import asyncio  # Ajout de asyncio pour la gestion des appels asynchrones
     
     # Démarrer l'API en arrière-plan
     def run_api():
@@ -115,4 +118,4 @@ if __name__ == "__main__":
     
     # Lancer l'interface utilisateur
     print("Starting Streamlit interface...")
-    streamlit_interface()
+    asyncio.run(streamlit_interface())  # Utilisation de asyncio.run pour lancer l'interface utilisateur
