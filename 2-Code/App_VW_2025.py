@@ -35,25 +35,32 @@ def recognize_speech():
     result = speech_recognizer.recognize_once()
     
     if result.reason == speechsdk.ResultReason.RecognizedSpeech:
+        print(f"Recognized: {result.text}")
         return result.text
+    print(f"No speech recognized, reason: {result.reason}")
     return None
 
 # Extraction des intentions (lieu et date) avec NLP
 def extract_location_and_date(text):
+    print(f"Extracting location and date from text: {text}")
     doc = nlp(text)
     location = None
     date = "Aujourd'hui"
     
     for ent in doc.ents:
+        print(f"Entity found: {ent.text} ({ent.label_})")
         if ent.label_ == "LOC":
             location = ent.text
         if ent.label_ in ["DATE", "TIME"]:
             date = ent.text
     
-    return location or "Non spécifié", date
+    location = location or "Non spécifié"
+    print(f"Extracted location: {location}, date: {date}")
+    return location, date
 
 # Appel asynchrone à l'API météo
 async def get_weather(city):
+    print(f"Fetching weather for city: {city}")
     async with httpx.AsyncClient() as client:
         url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={API_WEATHER_KEY}&units=metric&lang=fr"
         response = await client.get(url)
@@ -61,6 +68,7 @@ async def get_weather(city):
         print(f"API Response: {response.status_code} - {response.text}")
         if response.status_code == 200:
             data = response.json()
+            print(f"Weather data: {data}")
             return {
                 "description": data["weather"][0]["description"],
                 "temperature": data["main"]["temp"],
@@ -72,6 +80,7 @@ async def get_weather(city):
 # API FastAPI
 @app.get("/meteo/{ville}")
 async def meteo(ville: str):
+    print(f"API call received for city: {ville}")
     return await get_weather(ville)
 
 # Interface utilisateur avec Streamlit
@@ -98,10 +107,12 @@ if __name__ == "__main__":
     
     # Démarrer l'API en arrière-plan
     def run_api():
+        print("Starting FastAPI server...")
         uvicorn.run(app, host="0.0.0.0", port=8000)
     
     api_thread = threading.Thread(target=run_api)
     api_thread.start()
     
     # Lancer l'interface utilisateur
+    print("Starting Streamlit interface...")
     streamlit_interface()
