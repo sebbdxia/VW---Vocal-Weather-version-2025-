@@ -5,7 +5,7 @@ import sqlalchemy
 from sqlalchemy.orm import sessionmaker
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from pydantic import BaseModel
-from jose import JWTError, jwt
+import jwt  # Remplacer l'importation de jose par pyjwt
 from dotenv import load_dotenv
 
 # Charger les variables d'environnement
@@ -38,7 +38,9 @@ def verify_token(token: str):
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         return payload
-    except JWTError:
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expiré")
+    except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Token invalide")
 
 # Reconnaissance vocale avec Azure Speech-to-Text
@@ -74,8 +76,11 @@ def extract_intent(text: str):
 
     return {"city": city, "date": date}
 
+class IntentRequest(BaseModel):
+    text: str
+
 @app.post("/extract_intent")
-def extract_user_intent(request: BaseModel):
+def extract_user_intent(request: IntentRequest):
     return extract_intent(request.text)
 
 # API météo
