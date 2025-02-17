@@ -22,3 +22,29 @@ __pycache__/
 # Fichiers de l'IDE
 .vscode/
 .idea/
+
+# Fichiers spécifiques à GitHub
+.github/
+
+# Node.js environment
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Python virtual environment
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# macOS files
+.DS_Store
+
+# Windows files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Backup files
+*.bak
+*.swp
+*.swo
