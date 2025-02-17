@@ -6,6 +6,12 @@ setup(
     packages=find_packages(),
     install_requires=[
         "azure-cognitiveservices-speech",
-        # ...existing dependencies...
+        "httpx",
+        "spacy",
+        "uvicorn",
+        "streamlit",
+        "fastapi",
+        "python-dotenv",
+        # ...autres dépendances nécessaires...
     ],
 )
