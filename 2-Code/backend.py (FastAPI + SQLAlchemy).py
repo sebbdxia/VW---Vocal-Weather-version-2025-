@@ -105,7 +105,7 @@ def obtenir_prevision(location: str, time_horizon: str) -> dict:
         logger.exception("Exception lors de l'appel à l'API météo")
         raise HTTPException(status_code=500, detail=str(e))
 
-# Endpoint pour traiter un fichier audio contenant la commande vocale
+# Endpoint pour traiter une commande vocale captée directement depuis le front-end
 @app.post("/process", dependencies=[Depends(verify_api_key)])
 async def process_audio(file: UploadFile = File(...), db=Depends(get_db)):
     try:
