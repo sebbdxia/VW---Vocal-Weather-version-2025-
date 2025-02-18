@@ -7,9 +7,10 @@ from jose import JWTError, jwt
 import datetime
 import azure.cognitiveservices.speech as speechsdk
 import requests
+import json
 from pydantic import BaseModel
 
-# Configuration SQL
+# Configuration SQL (Azure SQL Database)
 DATABASE_URL = "mssql+pyodbc://user:password@server.database.windows.net/dbname?driver=ODBC+Driver+17+for+SQL+Server"
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)

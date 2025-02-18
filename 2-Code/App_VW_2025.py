@@ -1,159 +1,227 @@
 import os
-import sys
-import subprocess
-
-# Vérification préalable pour éviter les conflits d'importation (ex: répertoire nommé "numpy")
-if os.path.basename(os.getcwd()).lower() == "numpy":
-    sys.exit("Erreur : Exécutez ce script depuis un répertoire différent de 'numpy' pour éviter des conflits d'importation.")
-
-# Vérification et installation de NumPy
-try:
-    import numpy as np
-except ImportError as e:
-    print("Erreur lors de l'importation de numpy :", e)
-    print("Tentative de réinstallation de numpy...")
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "--force-reinstall", "numpy"])
-        import numpy as np
-        print("Numpy réinstallé avec succès, version :", np.__version__)
-    except Exception as e:
-        sys.exit("Impossible de réinstaller numpy automatiquement : " + str(e))
-
-# Vérification et installation de pydantic_core (nécessaire pour FastAPI et Pydantic)
-try:
-    import pydantic_core
-except ImportError as e:
-    print("Erreur lors de l'importation de pydantic_core :", e)
-    print("Tentative de réinstallation de pydantic_core...")
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "--force-reinstall", "pydantic-core"])
-        import pydantic_core
-        print("pydantic_core réinstallé avec succès, version :", pydantic_core.__version__)
-    except Exception as e:
-        sys.exit("Impossible de réinstaller pydantic_core automatiquement : " + str(e))
-
-# Import des autres modules nécessaires
-import asyncio
-import threading
-import logging
-from dotenv import load_dotenv
-
+import json
+import re
+import requests
+import psycopg2
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from pydantic import BaseModel
 import azure.cognitiveservices.speech as speechsdk
-import httpx
 import spacy
-import uvicorn
-import streamlit as st
-from fastapi import FastAPI, HTTPException
 
-# Configuration du logging pour une traçabilité accrue
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# Chargement du modèle français spaCy
+nlp = spacy.load("fr_core_news_sm")
 
-# Chargement des variables d'environnement
-load_dotenv()
-AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
-AZURE_REGION = os.getenv("AZURE_REGION")
-API_WEATHER_KEY = os.getenv("API_WEATHER_KEY")
+# Importation des modules d'interface (Streamlit) si en mode UI
+if os.getenv("MODE", "API") == "UI":
+    import streamlit as st
+    import pandas as pd
+    import folium
+    from streamlit_folium import st_folium
 
-if not all([AZURE_SPEECH_KEY, AZURE_REGION, API_WEATHER_KEY]):
-    logging.error("Les clés d'API nécessaires ne sont pas toutes définies dans les variables d'environnement.")
-    sys.exit(1)
+# Configuration des services externes
+AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY", "54124b94ae904eeea1d8a652a4c3d88d")
+AZURE_REGION = os.getenv("AZURE_REGION", "francecentral")
+# Nous n'utilisons pas Azure LUIS pour l'analyse NLP dans cette version.
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "a22a068e82f080385e390ae87d801800")
 
-logging.info("Les variables d'environnement ont été chargées avec succès.")
+# Configuration PostgreSQL (Azure)
+DB_USER = os.getenv("DB_USER", "sebastien")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "GRETAP4!2025***")
+DB_HOST = os.getenv("DB_HOST", "vw-sebastien.postgres.database.azure.com")
+DB_NAME = os.getenv("DB_NAME", "postgres")
+DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}"
 
-# Chargement du modèle NLP spaCy
-try:
-    nlp = spacy.load("fr_core_news_sm")
-    logging.info("Le modèle spaCy a été chargé avec succès.")
-except Exception as e:
-    logging.error("Erreur lors du chargement du modèle spaCy : %s", e)
-    sys.exit(1)
-
-# Création de l'application FastAPI
+# Initialisation de FastAPI avec authentification HTTP Basic
 app = FastAPI()
+security = HTTPBasic()
+
+# Modèles de requête via Pydantic
+class WeatherRequest(BaseModel):
+    location: str
+    days: int
+
+class VoiceRequest(BaseModel):
+    text: str
+
+def initialize_database():
+    connection = None  # Déclaration explicite avant le try
+    try:
+        connection = psycopg2.connect(DATABASE_URL)
+        cursor = connection.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS weather_queries (
+                id SERIAL PRIMARY KEY,
+                location TEXT,
+                days INTEGER,
+                response JSONB,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        connection.commit()
+        cursor.close()
+    except Exception as e:
+        print(f"Erreur lors de l'initialisation de la base de données : {e}")
+    finally:
+        if connection is not None:
+            connection.close()
+
+initialize_database()
 
 def recognize_speech():
     speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_REGION)
-    audio_config = speechsdk.AudioConfig(use_default_microphone=True)
-    speech_recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
-
-    logging.info("Veuillez parler...")
+    speech_recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config)
+    print("Veuillez parler...")
     result = speech_recognizer.recognize_once()
-
     if result.reason == speechsdk.ResultReason.RecognizedSpeech:
-        logging.info("Texte reconnu : %s", result.text)
         return result.text
-    logging.warning("Reconnaissance échouée, raison : %s", result.reason)
-    return None
+    else:
+        return ""
 
-def extract_location_and_date(text):
-    logging.info("Analyse du texte afin d'extraire le lieu et la date.")
+# Extraction d'entités via spaCy (pour le lieu et le nombre de jours)
+def extract_entities(text: str):
     doc = nlp(text)
     location = None
-    date = "Aujourd'hui"
+    days = None
     for ent in doc.ents:
-        logging.debug("Entité détectée : %s (%s)", ent.text, ent.label_)
-        if ent.label_ == "LOC":
+        # Les entités de type LOC ou GPE seront considérées comme des lieux
+        if ent.label_ in ("LOC", "GPE"):
             location = ent.text
-        elif ent.label_ in ["DATE", "TIME"]:
-            date = ent.text
-    location = location or "Non spécifié"
-    logging.info("Extraction terminée : lieu = %s, date = %s", location, date)
-    return location, date
-
-async def get_weather(city):
-    logging.info("Récupération des données météo pour : %s", city)
-    url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={API_WEATHER_KEY}&units=metric&lang=fr"
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.get(url)
-        except Exception as e:
-            logging.error("Erreur lors de la requête API : %s", e)
-            raise HTTPException(status_code=500, detail="Erreur lors de l'appel à l'API météo")
-    if response.status_code == 200:
-        data = response.json()
-        logging.debug("Données météo reçues : %s", data)
-        return {
-            "description": data["weather"][0]["description"],
-            "temperature": data["main"]["temp"],
-            "humidity": data["main"]["humidity"],
-            "wind_speed": data["wind"]["speed"]
-        }
-    logging.error("Ville non trouvée, code de réponse : %s", response.status_code)
-    raise HTTPException(status_code=404, detail="Ville non trouvée")
-
-@app.get("/meteo/{ville}")
-async def meteo(ville: str):
-    logging.info("Requête API reçue pour la ville : %s", ville)
-    return await get_weather(ville)
-
-async def streamlit_interface():
-    st.title("Assistant Météo Vocal")
-    if st.button("Parlez"):
-        text = recognize_speech()
-        if text:
-            location, date = extract_location_and_date(text)
+        # Les entités de type CARDINAL seront utilisées pour le nombre de jours
+        elif ent.label_ == "CARDINAL":
             try:
-                meteo_data = await get_weather(location)
-                st.write(f"Prévisions météo pour {location} ({date}) :")
-                st.write(f"- {meteo_data['description']}")
-                st.write(f"- Température : {meteo_data['temperature']}°C")
-                st.write(f"- Humidité : {meteo_data['humidity']}%")
-                st.write(f"- Vent : {meteo_data['wind_speed']} km/h")
-            except HTTPException as e:
-                st.error("Ville introuvable")
+                days = int(ent.text)
+            except ValueError:
+                pass
+    if location is None:
+        location = "Paris"
+    if days is None:
+        days = 3
+    return {"location": location, "days": days}
+
+def get_weather(location: str, days: int):
+    url = f"https://api.openweathermap.org/data/2.5/forecast?q={location}&cnt={days}&appid={OPENWEATHER_API_KEY}&units=metric"
+    response = requests.get(url)
+    if response.status_code != 200:
+        raise HTTPException(status_code=400, detail="Erreur lors de l'appel à l'API météo")
+    return response.json()
+
+def store_query(location: str, days: int, response_data: dict):
+    connection = None
+    try:
+        connection = psycopg2.connect(DATABASE_URL)
+        cursor = connection.cursor()
+        cursor.execute(
+            "INSERT INTO weather_queries (location, days, response) VALUES (%s, %s, %s)",
+            (location, days, json.dumps(response_data))
+        )
+        connection.commit()
+        cursor.close()
+    except Exception as e:
+        print(f"Erreur lors du stockage de la requête : {e}")
+    finally:
+        if connection is not None:
+            connection.close()
+
+def get_stored_queries():
+    connection = None
+    try:
+        connection = psycopg2.connect(DATABASE_URL)
+        cursor = connection.cursor()
+        cursor.execute("SELECT id, location, days, response, timestamp FROM weather_queries ORDER BY timestamp DESC")
+        rows = cursor.fetchall()
+        cursor.close()
+        return rows
+    except Exception as e:
+        print(f"Erreur lors de la récupération des requêtes : {e}")
+        return []
+    finally:
+        if connection is not None:
+            connection.close()
+
+@app.post("/weather/")
+def fetch_weather(request: WeatherRequest, credentials: HTTPBasicCredentials = Depends(security)):
+    if credentials.username != "admin" or credentials.password != "password":
+        raise HTTPException(status_code=401, detail="Authentification requise")
+    weather_data = get_weather(request.location, request.days)
+    store_query(request.location, request.days, weather_data)
+    return weather_data
+
+@app.post("/weather/voice/")
+def fetch_weather_from_voice(request: VoiceRequest, credentials: HTTPBasicCredentials = Depends(security)):
+    if credentials.username != "admin" or credentials.password != "password":
+        raise HTTPException(status_code=401, detail="Authentification requise")
+    entities = extract_entities(request.text)
+    location = entities["location"]
+    days = entities["days"]
+    weather_data = get_weather(location, days)
+    store_query(location, days, weather_data)
+    return {"location": location, "days": days, "weather": weather_data}
+
+if os.getenv("MODE", "API") == "UI":
+    st.sidebar.title("Navigation")
+    page = st.sidebar.radio("Aller à", ["Prévisions Météo", "Analyse et Monitoring"])
+
+    if page == "Prévisions Météo":
+        st.title("Prévisions Météo")
+        location_input = st.text_input("Entrez un lieu :", "Paris")
+        days_input = st.slider("Nombre de jours", 1, 7, 3)
+
+        # Affichage d'une carte interactive avec Folium
+        m = folium.Map(location=[48.8566, 2.3522], zoom_start=5)
+        st_folium(m, width=700, height=500)
+
+        if st.button("Obtenir la météo"):
+            try:
+                response = requests.post(
+                    "http://127.0.0.1:8000/weather/",
+                    auth=("admin", "password"),
+                    json={"location": location_input, "days": days_input}
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    st.write(data)
+                else:
+                    st.error("Erreur lors de la récupération des données météo")
             except Exception as e:
-                st.error(f"Erreur : {str(e)}")
+                st.error(f"Erreur : {e}")
+
+        if st.button("Reconnaissance vocale"):
+            recognized_text = recognize_speech()
+            st.write(f"Texte reconnu : {recognized_text}")
+            if recognized_text:
+                try:
+                    response = requests.post(
+                        "http://127.0.0.1:8000/weather/voice/",
+                        auth=("admin", "password"),
+                        json={"text": recognized_text}
+                    )
+                    if response.status_code == 200:
+                        result = response.json()
+                        st.write(result)
+                    else:
+                        st.error("Erreur lors du traitement de la commande vocale")
+                except Exception as e:
+                    st.error(f"Erreur : {e}")
+
+    elif page == "Analyse et Monitoring":
+        st.title("Analyse et Monitoring")
+        stored_queries = get_stored_queries()
+        if stored_queries:
+            df = pd.DataFrame(stored_queries, columns=["ID", "Lieu", "Jours", "Réponse", "Timestamp"])
+            st.write(df)
         else:
-            st.error("Aucun texte reconnu. Veuillez réessayer.")
+            st.write("Aucune donnée enregistrée.")
 
-if __name__ == "__main__":
-    # Lancement du serveur FastAPI dans un thread séparé
-    def run_api():
-        logging.info("Lancement du serveur FastAPI...")
-        uvicorn.run(app, host="0.0.0.0", port=8000)
+    st.sidebar.text("Application Dockerisée")
 
-    api_thread = threading.Thread(target=run_api, daemon=True)
-    api_thread.start()
+dockerfile_content = '''
+FROM python:3.9-slim
+WORKDIR /app
+COPY . /app
+RUN pip install --no-cache-dir -r requirements.txt
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+'''
 
-    logging.info("Lancement de l'interface Streamlit...")
-    asyncio.run(streamlit_interface())
+with open("Dockerfile", "w") as f:
+    f.write(dockerfile_content)

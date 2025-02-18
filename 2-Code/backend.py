@@ -1,147 +1,170 @@
-from fastapi import FastAPI, Depends, HTTPException, status
-from sqlalchemy import Column, Integer, String, create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
-from passlib.context import CryptContext
-from jose import JWTError, jwt
-import datetime
+from fastapi import FastAPI, HTTPException, Depends, File, UploadFile, Form
+from sqlalchemy import create_engine, Column, Integer, String, Text
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
 import azure.cognitiveservices.speech as speechsdk
 import requests
 import json
-from pydantic import BaseModel
+import os
+from pydantic import BaseModel, Field
+import logging
+import tempfile
 
-# Configuration SQL (Azure SQL Database)
-DATABASE_URL = "mssql+pyodbc://user:password@server.database.windows.net/dbname?driver=ODBC+Driver+17+for+SQL+Server"
-engine = create_engine(DATABASE_URL)
+# Configuration des logs
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Configuration PostgreSQL (Azure)
+DB_USER = os.getenv("DB_USER", "sebastien")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "GRETAP4!2025***")
+DB_HOST = os.getenv("DB_HOST", "vw-sebastien.postgres.database.azure.com")
+DB_NAME = os.getenv("DB_NAME", "postgres")
+DATABASE_URL = f"postgresql://sebastien:GRETAP4!2025***@vw-sebastien.postgres.database.azure.com/postgres"
+
+engine = create_engine(DATABASE_URL, echo=True)
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
-# Clé secrète pour JWT
-SECRET_KEY = "supersecretkey"
-ALGORITHM = "HS256"
-
-# Configuration Azure
-AZURE_SPEECH_KEY = "VOTRE_CLEF_AZURE_SPEECH"
-AZURE_REGION = "VOTRE_REGION"
-WEATHER_API_KEY = "VOTRE_CLEF_METEO"
-WEATHER_API_URL = "https://api.openweathermap.org/data/2.5/weather"
-
-# Sécurité des mots de passe
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-# Modèles SQL
-class User(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String, unique=True, index=True)
-    hashed_password = Column(String)
-
+# Modèles SQLAlchemy pour stocker les prévisions et les feedbacks
 class WeatherRequest(Base):
     __tablename__ = "weather_requests"
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer)
     location = Column(String)
-    date = Column(String)
-    weather_data = Column(String)
+    time_horizon = Column(String)
+    weather_data = Column(Text)
+
+class Feedback(Base):
+    __tablename__ = "feedbacks"
+    id = Column(Integer, primary_key=True, index=True)
+    query_id = Column(String, index=True)
+    actual_forecast = Column(Text)
 
 Base.metadata.create_all(bind=engine)
 
-# Modèles Pydantic
-class UserCreate(BaseModel):
-    username: str
-    password: str
-
-class UserLogin(BaseModel):
-    username: str
-    password: str
-
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-
-class WeatherAudio(BaseModel):
-    audio_file: str
-
-# Création d'un utilisateur
-def create_user(db: Session, user: UserCreate):
-    hashed_password = pwd_context.hash(user.password)
-    db_user = User(username=user.username, hashed_password=hashed_password)
-    db.add(db_user)
-    db.commit()
-    db.refresh(db_user)
-    return db_user
-
-# Vérification du mot de passe
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
-
-# Authentification utilisateur
-def authenticate_user(db: Session, username: str, password: str):
-    user = db.query(User).filter(User.username == username).first()
-    if not user or not verify_password(password, user.hashed_password):
-        return None
-    return user
-
-# Génération de JWT
-def create_jwt_token(data: dict):
-    expire = datetime.datetime.utcnow() + datetime.timedelta(hours=1)
-    data.update({"exp": expire})
-    return jwt.encode(data, SECRET_KEY, algorithm=ALGORITHM)
-
-# Middleware pour récupérer l'utilisateur
-def get_current_user(token: str, db: Session = Depends(SessionLocal)):
+def get_db():
+    db = SessionLocal()
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user = db.query(User).filter(User.username == payload.get("sub")).first()
-        return user
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Token invalide")
+        yield db
+    finally:
+        db.close()
 
-# FastAPI App
+# Configuration Azure Speech-to-Text
+AZURE_SPEECH_KEY = "54124b94ae904eeea1d8a652a4c3d88d"
+AZURE_REGION = "francecentral"
+
+# Configuration API Météo
+WEATHER_API_KEY = os.getenv("WEATHER_API_KEY", "VOTRE_CLEF_METEO")
+WEATHER_API_URL = "https://api.openweathermap.org/data/2.5/weather"
+
+# Modèle Pydantic pour le feedback
+class FeedbackPayload(BaseModel):
+    query_id: str = Field(..., example="12345")
+    actual_forecast: dict = Field(..., example={"main": {"temp": 22.5}})
+
+# Fonction simulant le traitement NLP pour extraire la localité et l'horizon depuis une transcription
+def extract_entities(text: str):
+    try:
+        parts = text.split(',')
+        location = parts[0].strip() if parts else text.strip()
+        time_horizon = parts[1].strip() if len(parts) > 1 else "today"
+    except Exception as e:
+        logger.error(f"Erreur d'extraction NLP: {e}")
+        location, time_horizon = text.strip(), "today"
+    return location, time_horizon
+
 app = FastAPI()
 
-@app.post("/register/", response_model=Token)
-def register(user: UserCreate, db: Session = Depends(SessionLocal)):
-    if db.query(User).filter(User.username == user.username).first():
-        raise HTTPException(status_code=400, detail="Nom d'utilisateur déjà pris")
-    user = create_user(db, user)
-    token = create_jwt_token({"sub": user.username})
-    return {"access_token": token, "token_type": "bearer"}
-
-@app.post("/login/", response_model=Token)
-def login(user: UserLogin, db: Session = Depends(SessionLocal)):
-    user = authenticate_user(db, user.username, user.password)
-    if not user:
-        raise HTTPException(status_code=400, detail="Identifiants incorrects")
-    token = create_jwt_token({"sub": user.username})
-    return {"access_token": token, "token_type": "bearer"}
-
-@app.post("/process_weather/")
-def process_weather(request: WeatherAudio, current_user: User = Depends(get_current_user), db: Session = Depends(SessionLocal)):
-    # Convertir l'audio en texte avec Azure Speech-to-Text
-    speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_REGION)
-    audio_config = speechsdk.AudioConfig(filename=request.audio_file)
-    recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
-    result = recognizer.recognize_once()
+@app.post("/process")
+async def process_weather(
+    file: UploadFile = File(None),
+    manual_location: str = Form(None),
+    manual_date: str = Form(None),
+    db: Session = Depends(get_db)
+):
+    transcription = ""
+    # Si un fichier audio est fourni, on réalise la reconnaissance vocale
+    if file is not None:
+        try:
+            contents = await file.read()
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                tmp.write(contents)
+                temp_file_path = tmp.name
+        except Exception as e:
+            logger.error(f"Erreur lors de la création du fichier temporaire: {e}")
+            raise HTTPException(status_code=500, detail="Erreur lors de la création du fichier audio temporaire")
+        
+        try:
+            speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_REGION)
+            audio_config = speechsdk.AudioConfig(filename=temp_file_path)
+            recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
+            result = recognizer.recognize_once()
+            if result.reason == speechsdk.ResultReason.RecognizedSpeech:
+                transcription = result.text
+            else:
+                logger.error("Échec de la reconnaissance vocale")
+                raise HTTPException(status_code=400, detail="Échec de la reconnaissance vocale")
+        except Exception as e:
+            logger.error(f"Erreur lors de la reconnaissance vocale: {e}")
+            raise HTTPException(status_code=500, detail="Erreur lors de la reconnaissance vocale")
+        finally:
+            os.remove(temp_file_path)
     
-    if result.reason != speechsdk.ResultReason.RecognizedSpeech:
-        raise HTTPException(status_code=400, detail="Échec de la reconnaissance vocale")
-
-    text = result.text
-    location = text  # Supposons que le texte soit directement le lieu
-
-    # Récupérer la météo
+    # Détermination de la localité : la saisie manuelle prime sur la commande vocale
+    if manual_location:
+        location = manual_location
+    elif transcription:
+        location, extracted_time_horizon = extract_entities(transcription)
+    else:
+        raise HTTPException(status_code=400, detail="Aucune information fournie pour la localité (commande vocale ou saisie manuelle requise).")
+    
+    # Détermination de l'horizon temporel : la saisie manuelle prime, sinon on extrait ou on utilise une valeur par défaut
+    if manual_date:
+        time_horizon = manual_date
+    elif transcription:
+        # Si aucune date manuelle n'est fournie, on tente d'extraire l'horizon depuis la transcription
+        if not manual_location:
+            _, extracted_time_horizon = extract_entities(transcription)
+            time_horizon = extracted_time_horizon
+        else:
+            time_horizon = "today"
+    else:
+        time_horizon = "today"
+    
+    logger.info(f"Localité utilisée: {location} | Horizon temporel: {time_horizon} | Transcription: {transcription}")
+    
+    # Appel à l'API météo
     params = {"q": location, "appid": WEATHER_API_KEY, "units": "metric"}
-    response = requests.get(WEATHER_API_URL, params=params)
-
-    if response.status_code != 200:
-        raise HTTPException(status_code=500, detail="Erreur API météo")
-
+    try:
+        response = requests.get(WEATHER_API_URL, params=params, timeout=10)
+        response.raise_for_status()
+    except Exception as e:
+        logger.error(f"Erreur lors de l'appel à l'API météo: {e}")
+        raise HTTPException(status_code=500, detail="Erreur lors de l'appel à l'API météo")
+    
     weather_data = response.json()
 
-    # Sauvegarde en base SQL
-    db_request = WeatherRequest(user_id=current_user.id, location=location, date="today", weather_data=json.dumps(weather_data))
-    db.add(db_request)
-    db.commit()
+    try:
+        db_request = WeatherRequest(location=location, time_horizon=time_horizon, weather_data=json.dumps(weather_data))
+        db.add(db_request)
+        db.commit()
+    except Exception as e:
+        logger.error(f"Erreur lors de l'enregistrement en base: {e}")
+        raise HTTPException(status_code=500, detail="Erreur lors de l'enregistrement des données")
     
-    return {"location": location, "weather": weather_data}
+    return {
+        "transcription": transcription,
+        "location": location,
+        "time_horizon": time_horizon,
+        "forecast": weather_data
+    }
+
+@app.post("/feedback")
+def submit_feedback(payload: FeedbackPayload, db: Session = Depends(get_db)):
+    try:
+        feedback_entry = Feedback(query_id=payload.query_id, actual_forecast=json.dumps(payload.actual_forecast))
+        db.add(feedback_entry)
+        db.commit()
+    except Exception as e:
+        logger.error(f"Erreur lors de l'enregistrement du feedback: {e}")
+        raise HTTPException(status_code=500, detail="Erreur lors de l'enregistrement du feedback")
+    
+    return {"message": "Feedback enregistré avec succès.", "query_id": payload.query_id}
