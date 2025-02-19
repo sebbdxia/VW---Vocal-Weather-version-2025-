@@ -15,7 +15,7 @@ from pydantic import BaseModel
 import streamlit as st
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, AudioProcessorBase
 
-# Pour le caching et retry dans les appels Open-Meteo
+# Pour le caching et retry lors des appels à Open-Meteo
 import requests_cache
 import pandas as pd
 from retry_requests import retry
@@ -68,7 +68,7 @@ async def process_command(
     horizon: str = Form(None)
 ):
     try:
-        # 1. Si un fichier audio est fourni, simuler la transcription
+        # 1. Transcription (simulation si audio fourni)
         if file is not None:
             audio_bytes = await file.read()
             transcription_result = azure_speech_to_text(audio_bytes)
@@ -76,7 +76,7 @@ async def process_command(
         else:
             transcription_final = transcription or ""
         
-        # 2. Extraction automatique avec spaCy (ville et horizon)
+        # 2. Extraction automatique via spaCy (ville et horizon)
         if transcription_final:
             extracted_city, extracted_horizon = spacy_analyze(transcription_final)
         else:
@@ -86,7 +86,7 @@ async def process_command(
         final_city = city if city else (extracted_city if extracted_city else "Paris")
         final_horizon = horizon if horizon else (extracted_horizon if extracted_horizon else "demain")
         
-        # 4. Récupération de la prévision météo via Open-Meteo (hourly uniquement)
+        # 4. Récupération de la prévision météo via Open-Meteo (hourly)
         hourly_dataframe = get_weather_forecast(final_city)
         logging.info(f"Prévision météo récupérée (hourly) pour {final_city}")
         
@@ -110,7 +110,7 @@ def analysis():
     return {"total_requests": total_requests, "logs": logs}
 
 def azure_speech_to_text(audio_bytes: bytes) -> str:
-    # Simulation d'appel à Azure Speech-to-Text
+    # Simulation d'appel à Azure Speech-to-Text (à remplacer par l'intégration réelle)
     return "transcrire l'audio: Paris demain"
 
 from typing import Tuple
@@ -131,8 +131,6 @@ def spacy_analyze(text: str) -> Tuple[str, str]:
     return location, horizon
 
 # -------------------- Géocodage via Nominatim --------------------
-from typing import Tuple
-
 def get_coordinates(city_name: str) -> Tuple[float, float]:
     geocode_url = "https://nominatim.openstreetmap.org/search"
     params = {"q": city_name, "format": "json"}
@@ -145,7 +143,7 @@ def get_coordinates(city_name: str) -> Tuple[float, float]:
     lon = float(data[0]["lon"])
     return lat, lon
 
-# -------------------- Récupération de la prévision météo (Open-Meteo snippet) --------------------
+# -------------------- Récupération de la prévision météo via Open-Meteo --------------------
 def get_weather_forecast(city_name: str) -> pd.DataFrame:
     lat, lon = get_coordinates(city_name)
     url = "https://api.open-meteo.com/v1/forecast"
@@ -161,7 +159,7 @@ def get_weather_forecast(city_name: str) -> pd.DataFrame:
     temperature = data['hourly']['temperature_2m']
     cloudcover = data['hourly']['cloudcover']
     windspeed = data['hourly']['windspeed_10m']
-    # Pour simuler la pollution, on ajoute une valeur fictive
+    # Simulation de la pollution
     pm25 = [12.3] * len(times)
     df = pd.DataFrame({
         "date": times,
@@ -196,7 +194,7 @@ if "backend_started" not in st.session_state:
 # -------------------- Interface Streamlit (Frontend) --------------------
 st.title("Application Météo – Commande vocale / manuelle (Open-Meteo)")
 
-# Onglets pour navigation dans l'interface
+# Onglets de navigation
 tab1, tab2, tab3 = st.tabs(["Prévisions (Python)", "Analyse & Monitoring", "Dashboard HTML/JS"])
 
 with tab1:
@@ -269,14 +267,13 @@ with tab1:
                 df = pd.DataFrame(hourly_list)
                 df['date'] = pd.to_datetime(df['date'])
                 df['hour'] = df['date'].dt.hour
-                # Filtrer pour les heures 9h, 12h, 15h, 18h, 21h
-                desired_hours = [9, 12, 15, 18, 21]
-                df_filtered = df[df['hour'].isin(desired_hours)].sort_values(by='date')
-                st.subheader("Prévisions sélectionnées")
+                # Filtrer pour n'afficher que la prévision de midi (12h00) pour 7 jours
+                df_filtered = df[df['hour'] == 12].sort_values(by='date').head(7)
+                st.subheader("Prévisions de Midi sur 7 Jours")
                 cols = st.columns(len(df_filtered))
                 for idx, (_, row) in enumerate(df_filtered.iterrows()):
                     with cols[idx]:
-                        st.markdown(f"**{row['date'].strftime('%H:%M')}**")
+                        st.markdown(f"**{row['date'].strftime('%A %d %b')}**")
                         st.metric(label="🌡️ Température", value=f"{row['temperature_2m']:.1f} °C")
                         st.metric(label="☁️ Ciel", value=f"{row['cloudcover']:.0f} %")
                         st.metric(label="💨 Vent", value=f"{row['windspeed_10m']:.1f} km/h")
@@ -302,39 +299,68 @@ with tab2:
             st.error("Erreur lors de la récupération des données d'analyse.")
     except Exception as e:
         st.error("Impossible de joindre le backend pour l'analyse.")
-
+    
 with tab3:
     st.header("Dashboard HTML/JS")
-    # Code HTML et JavaScript intégré pour le dashboard
+    # Dashboard autonome en HTML affichant uniquement la prévision de midi pour 7 jours
     html_dashboard = """
     <!DOCTYPE html>
     <html lang="fr">
       <head>
         <meta charset="UTF-8" />
-        <title>Dashboard Open-Meteo</title>
+        <title>Dashboard Météo – Prévisions de Midi sur 7 Jours</title>
         <style>
-          body { font-family: Arial, sans-serif; background: #f0f4f7; margin: 0; padding: 20px; }
-          h1 { text-align: center; color: #333; }
-          #weather { display: flex; flex-wrap: wrap; justify-content: center; gap: 20px; }
-          .card { background: #fff; border-radius: 8px; padding: 16px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); width: 160px; text-align: center; }
-          .card h3 { margin: 0 0 10px; font-size: 1.2em; }
-          .card p { margin: 4px 0; font-size: 0.9em; }
+          body {
+            font-family: Arial, sans-serif;
+            background: #f0f4f7;
+            margin: 0;
+            padding: 20px;
+          }
+          h1 {
+            text-align: center;
+            color: #333;
+          }
+          #dashboard {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            gap: 20px;
+            margin-top: 20px;
+          }
+          .card {
+            background: #fff;
+            border-radius: 8px;
+            padding: 16px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            width: 180px;
+            text-align: center;
+          }
+          .card h2 {
+            margin: 0 0 10px;
+            font-size: 1.1em;
+            color: #0077cc;
+          }
+          .card p {
+            margin: 6px 0;
+            font-size: 0.95em;
+          }
         </style>
       </head>
       <body>
-        <h1>Dashboard Open-Meteo</h1>
-        <div id="weather">Chargement des prévisions…</div>
+        <h1>Prévisions de Midi sur 7 Jours</h1>
+        <div id="dashboard">Chargement des prévisions…</div>
         <script type="module">
           import { fetchWeatherApi } from 'https://cdn.jsdelivr.net/npm/openmeteo@1.0.2/dist/openmeteo.mjs';
+          // Fonction utilitaire pour générer une plage de nombres
           const range = (start, stop, step) =>
             Array.from({ length: Math.floor((stop - start) / step) }, (_, i) => start + i * step);
           async function main() {
+            // Paramètres pour récupérer les prévisions horaires depuis Open-Meteo pour Paris
             const params = {
-              "latitude": 48.8534,
-              "longitude": 2.3488,
-              "current": ["temperature_2m", "relative_humidity_2m", "apparent_temperature", "is_day", "precipitation", "rain", "showers", "snowfall", "weather_code", "cloud_cover", "pressure_msl", "surface_pressure", "wind_speed_10m", "wind_direction_10m"],
-              "hourly": ["temperature_2m", "apparent_temperature", "precipitation_probability", "precipitation", "rain", "weather_code", "pressure_msl", "surface_pressure", "cloud_cover", "cloud_cover_low", "cloud_cover_mid", "cloud_cover_high", "visibility", "et0_fao_evapotranspiration"],
-              "daily": ["weather_code", "temperature_2m_max", "temperature_2m_min", "sunrise", "sunset", "daylight_duration", "sunshine_duration", "precipitation_sum", "rain_sum"]
+              latitude: 48.8534,
+              longitude: 2.3488,
+              hourly: ["temperature_2m", "cloudcover", "windspeed_10m"],
+              timezone: "auto"
             };
             const url = "https://api.open-meteo.com/v1/forecast";
             const responses = await fetchWeatherApi(url, params);
@@ -345,52 +371,48 @@ with tab3:
             const startTime = Number(hourly.time());
             const endTime = Number(hourly.timeEnd());
             const times = range(startTime, endTime, interval).map(
-              (t) => new Date((t + utcOffsetSeconds) * 1000)
+              t => new Date((t + utcOffsetSeconds) * 1000)
             );
             const hourlyTemp = hourly.variables(0).valuesArray();
-            const hourlyCloudCover = hourly.variables(8).valuesArray();
-            const current = response.current();
-            const currentWindSpeed = current.variables(12).value();
-            const simulatedPollution = 12.3;
-            const desiredHours = [9, 12, 15, 18, 21];
-            const selectedData = [];
+            const hourlyCloudCover = hourly.variables(1).valuesArray();
+            const hourlyWind = hourly.variables(2).valuesArray();
+            // Filtrer pour obtenir uniquement la prévision pour midi (12h00)
+            const forecasts = {};
             for (let i = 0; i < times.length; i++) {
-              if (desiredHours.includes(times[i].getHours())) {
-                selectedData.push({
+              if (times[i].getHours() === 12) {
+                const dateKey = times[i].toISOString().split("T")[0];
+                forecasts[dateKey] = {
                   time: times[i],
                   temperature: hourlyTemp[i],
                   cloudCover: hourlyCloudCover[i],
-                  windSpeed: currentWindSpeed,
-                  pollution: simulatedPollution
-                });
+                  windSpeed: hourlyWind[i]
+                };
               }
             }
-            const weatherDiv = document.getElementById("weather");
-            weatherDiv.innerHTML = "";
-            selectedData.forEach(data => {
+            // Transformer l'objet en tableau et ne garder que les 7 premiers jours
+            const forecastArray = Object.values(forecasts).slice(0, 7);
+            const dashboardDiv = document.getElementById("dashboard");
+            dashboardDiv.innerHTML = "";
+            forecastArray.forEach(forecast => {
               const card = document.createElement("div");
               card.className = "card";
-              const timeElem = document.createElement("h3");
-              timeElem.textContent = data.time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-              card.appendChild(timeElem);
-              const tempElem = document.createElement("p");
-              tempElem.innerHTML = `🌡️ Température: ${data.temperature} °C`;
-              card.appendChild(tempElem);
-                      const cloudElem = document.createElement("p");
-                      cloudElem.innerHTML = `☁️ Ciel: ${data.cloudCover} %`;
-                      card.appendChild(cloudElem);
-                      const windElem = document.createElement("p");
-                      windElem.innerHTML = `💨 Vent: ${data.windSpeed} km/h`;
-                      card.appendChild(windElem);
-                      const pollutionElem = document.createElement("p");
-                      pollutionElem.innerHTML = `😷 Pollution: ${data.pollution} µg/m³`;
-                      card.appendChild(pollutionElem);
-                      weatherDiv.appendChild(card);
-                    });
-                  }
-                  main();
-                </script>
-              </body>
-            </html>
-            """
-components.html(html_dashboard, height=600)
+              const options = { weekday: 'long', day: 'numeric', month: 'short' };
+              const dateStr = forecast.time.toLocaleDateString("fr-FR", options);
+              card.innerHTML = `
+                <h2>${dateStr}</h2>
+                <p>🌡️ Température : ${forecast.temperature} °C</p>
+                <p>☁️ Ciel : ${forecast.cloudCover} %</p>
+                <p>💨 Vent : ${forecast.windSpeed} km/h</p>
+              `;
+              dashboardDiv.appendChild(card);
+            });
+          }
+          main().catch(error => {
+            console.error("Erreur dans le dashboard :", error);
+            document.getElementById("dashboard").innerText = "Erreur de chargement des prévisions.";
+          });
+        </script>
+      </body>
+    </html>
+    """
+    components.html(html_dashboard, height=600, scrolling=True)
