@@ -420,9 +420,16 @@ with tab1:
                 "pm2_5": "Pollution (µg/m³)"
             }
         ))
+        st.subheader("Localisation de la ville")
+        try:
+            lat, lon = get_coordinates(result["location"])
+            map_data = pd.DataFrame({"lat": [lat], "lon": [lon]})
+            st.map(map_data)
+        except Exception as e:
+            st.error(f"Impossible d'afficher la carte: {e}")
         if result.get("transcription"):
             st.write("Transcription utilisée :", result["transcription"])
-    
+        
 with tab2:
     st.header("Analyse et Monitoring")
     try:
@@ -463,7 +470,6 @@ with tab2:
                             break
             if metrics_data:
                 df_metrics = pd.DataFrame(metrics_data)
-                # Adapter la taille de la colonne "Value"
                 df_metrics_styled = df_metrics.style.set_properties(subset=["Value"], **{'min-width': '300px'})
                 st.dataframe(df_metrics_styled)
                 st.markdown("**Définitions des métriques :**")
@@ -483,7 +489,6 @@ with tab2:
             st.subheader("Répartition des demandes par ville")
             top_cities_data = response.json()
             df_top = pd.DataFrame(list(top_cities_data.items()), columns=["Ville", "Nombre de demandes"])
-            # Adapter la largeur de la colonne "Ville" pour voir le nom en entier
             st.dataframe(df_top.style.set_properties(subset=["Ville"], **{'min-width': '200px'}))
         else:
             st.error("Erreur lors de la récupération des données par ville.")
