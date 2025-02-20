@@ -9,9 +9,10 @@ import time
 import re
 import tempfile
 import json
-from typing import Tuple
+from typing import Tuple, Callable
+from functools import wraps
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Response
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Response, Request
 from pydantic import BaseModel
 
 import streamlit as st
@@ -35,11 +36,12 @@ DB_HOST = os.getenv("DB_HOST", "vw-sebastien.postgres.database.azure.com")
 DB_NAME = os.getenv("DB_NAME", "postgres")
 
 # -------------------- Création d'un registre Prometheus personnalisé --------------------
-from prometheus_client import CollectorRegistry, Counter, generate_latest
+from prometheus_client import CollectorRegistry, Counter, Histogram, generate_latest
 prom_registry = CollectorRegistry(auto_describe=True)
 REQUEST_COUNT = Counter("request_count", "Total number of requests", registry=prom_registry)
 FORECAST_REQUESTS = Counter("forecast_requests", "Number of forecast requests", registry=prom_registry)
 ERRORS_COUNT = Counter("errors_count", "Number of errors", registry=prom_registry)
+REQUEST_LATENCY = Histogram("request_latency_seconds", "Request latency in seconds", registry=prom_registry)
 
 # -------------------- Setup de la session HTTP avec cache --------------------
 cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
@@ -53,7 +55,19 @@ app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
 nlp = spacy.load("fr_core_news_sm")
-logs = []
+logs = []            # Logs des commandes
+user_feedbacks = []  # Retours utilisateurs
+
+# Décorateur pour mesurer la latence
+def measure_latency(func: Callable):
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        start = time.time()
+        result = await func(*args, **kwargs)
+        elapsed = time.time() - start
+        REQUEST_LATENCY.observe(elapsed)
+        return result
+    return wrapper
 
 class WeatherResponse(BaseModel):
     location: str
@@ -61,8 +75,10 @@ class WeatherResponse(BaseModel):
     forecast_days: int
     message: str = None
     transcription: str = None
+    mode: str = None
 
 @app.post("/process_command", response_model=WeatherResponse)
+@measure_latency
 async def process_command(
     file: UploadFile = File(None),
     transcription: str = Form(None),
@@ -89,7 +105,7 @@ async def process_command(
         
         hourly_dataframe = get_weather_forecast(final_city)
         logging.info(f"Prévision météo récupérée pour {final_city}")
-        store_forecast_in_db(transcription_final, final_city, final_forecast_days, hourly_dataframe)
+        store_forecast_in_db(transcription_final, final_city, final_forecast_days, hourly_dataframe, "vocale" if file is not None else "manuel")
         
         FORECAST_REQUESTS.inc()
         forecast_dict = hourly_dataframe.to_dict(orient="records")
@@ -98,7 +114,8 @@ async def process_command(
             forecast={"hourly": forecast_dict},
             forecast_days=final_forecast_days,
             message="Prévision obtenue avec succès.",
-            transcription=transcription_final
+            transcription=transcription_final,
+            mode="vocale" if file is not None else "manuel"
         )
     except Exception as e:
         ERRORS_COUNT.inc()
@@ -107,18 +124,60 @@ async def process_command(
 
 @app.get("/analysis")
 def analysis():
-    return {"total_requests": len(logs), "logs": logs}
+    return {"total_requests": len(logs), "logs": logs, "feedbacks": user_feedbacks}
 
 @app.get("/metrics")
 def metrics():
     content = generate_latest(prom_registry)
     return Response(content=content, media_type="text/plain; version=0.0.4")
 
+@app.get("/top_cities")
+def top_cities():
+    city_counts = {}
+    for entry in logs:
+        city = entry.get("city", "Inconnu")
+        city_counts[city] = city_counts.get(city, 0) + 1
+    return city_counts
+
+@app.get("/feedbacks")
+def get_feedbacks():
+    return user_feedbacks
+
+@app.post("/feedback")
+def feedback(rating: int = Form(...), comment: str = Form("")):
+    entry = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "rating": rating,
+        "comment": comment
+    }
+    user_feedbacks.append(entry)
+    try:
+        import psycopg2
+        conn = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST)
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS feedback (
+                id SERIAL PRIMARY KEY,
+                timestamp TIMESTAMPTZ,
+                rating INTEGER,
+                comment TEXT
+            );
+        """)
+        cur.execute("""
+            INSERT INTO feedback (timestamp, rating, comment)
+            VALUES (%s, %s, %s)
+        """, (entry["timestamp"], entry["rating"], entry["comment"]))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logging.error(f"Erreur lors du stockage du feedback PostgreSQL: {e}")
+    return {"status": "Feedback enregistré"}
+
 def azure_speech_to_text(audio_bytes: bytes = None) -> str:
     import azure.cognitiveservices.speech as speechsdk
     speech_config = speechsdk.SpeechConfig(subscription=SPEECH_KEY, region=SPEECH_REGION)
     speech_config.speech_recognition_language = "fr-FR"
-    
     if audio_bytes:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
             temp_audio.write(audio_bytes)
@@ -126,18 +185,14 @@ def azure_speech_to_text(audio_bytes: bytes = None) -> str:
         audio_config = speechsdk.audio.AudioConfig(filename=temp_filename)
     else:
         audio_config = speechsdk.audio.AudioConfig(use_default_microphone=True)
-    
     speech_recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
     result = speech_recognizer.recognize_once_async().get()
-    
     if result.reason == speechsdk.ResultReason.RecognizedSpeech:
         recognized_text = result.text
     else:
         recognized_text = ""
-    
     if audio_bytes:
         os.remove(temp_filename)
-    
     return recognized_text
 
 def azure_speech_from_microphone() -> str:
@@ -146,10 +201,8 @@ def azure_speech_from_microphone() -> str:
     speech_config.speech_recognition_language = "fr-FR"
     audio_config = speechsdk.audio.AudioConfig(use_default_microphone=True)
     speech_recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
-    
     st.info("Veuillez parler...")
     result = speech_recognizer.recognize_once_async().get()
-    
     if result.reason == speechsdk.ResultReason.RecognizedSpeech:
         return result.text
     else:
@@ -217,13 +270,14 @@ def get_weather_forecast(city_name: str) -> pd.DataFrame:
     })
     return df
 
-def store_forecast_in_db(transcription: str, location: str, forecast_days: int, forecast_df: pd.DataFrame):
+def store_forecast_in_db(transcription: str, location: str, forecast_days: int, forecast_df: pd.DataFrame, mode: str):
     entry = {
         "timestamp": datetime.datetime.now().isoformat(),
         "transcription": transcription,
         "city": location,
         "forecast_days": forecast_days,
-        "forecast": forecast_df.to_dict(orient="records")
+        "forecast": forecast_df.to_dict(orient="records"),
+        "mode": mode
     }
     logs.append(entry)
     logging.info(f"Log stocké: {entry}")
@@ -238,13 +292,14 @@ def store_forecast_in_db(transcription: str, location: str, forecast_days: int, 
                 transcription TEXT,
                 city TEXT,
                 forecast_days INTEGER,
-                forecast JSONB
+                forecast JSONB,
+                mode TEXT
             );
         """)
         cur.execute("""
-            INSERT INTO forecasts (timestamp, transcription, city, forecast_days, forecast)
-            VALUES (%s, %s, %s, %s, %s)
-        """, (entry["timestamp"], entry["transcription"], entry["city"], entry["forecast_days"], json.dumps(entry["forecast"])))
+            INSERT INTO forecasts (timestamp, transcription, city, forecast_days, forecast, mode)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (entry["timestamp"], entry["transcription"], entry["city"], entry["forecast_days"], json.dumps(entry["forecast"]), entry["mode"]))
         conn.commit()
         cur.close()
         conn.close()
@@ -265,10 +320,11 @@ st.title("Application Météo – Commande vocale / manuelle (Open-Meteo)")
 if "forecast_response" not in st.session_state:
     st.session_state.forecast_response = None
 
-tab1, tab2 = st.tabs(["Prévisions (Python)", "Analyse & Monitoring"])
+# Création de trois onglets : Prévisions, Analyse & Monitoring, Feedback
+tab1, tab2, tab3 = st.tabs(["Prévisions", "Analyse & Monitoring", "Feedback"])
 
 with tab1:
-    st.header("Envoyer la commande au backend")
+    st.header("Bienvenu !")
     mode = st.radio("Choisissez votre mode de commande :", ("Enregistrement par micro", "Charger un fichier audio", "Manuelle"))
     
     audio_bytes = None
@@ -284,7 +340,7 @@ with tab1:
             transcription_input = azure_speech_from_microphone()
             st.write("Transcription obtenue :", transcription_input)
             backend_url = "http://localhost:8000/process_command"
-            data = {"transcription": transcription_input}
+            data = {"transcription": transcription_input, "mode": "vocale"}
             if city_input:
                 data["city"] = city_input
             response = requests.post(backend_url, data=data)
@@ -305,7 +361,6 @@ with tab1:
         city_input = st.text_input("Ville (optionnel)")
     else:
         st.subheader("Commande manuelle")
-        transcription_input = st.text_input("Transcription de la commande (facultatif)")
         city_input = st.text_input("Ville")
     
     if mode != "Enregistrement par micro" and st.button("Envoyer la commande"):
@@ -320,6 +375,7 @@ with tab1:
             data["city"] = city_input
         if forecast_days_input is not None:
             data["forecast_days"] = str(forecast_days_input)
+        data["mode"] = "manuel"
         try:
             response = requests.post(backend_url, files=files, data=data)
             if response.status_code == 200:
@@ -375,20 +431,24 @@ with tab2:
         if response.status_code == 200:
             data_analysis = response.json()
             st.write("Nombre total de requêtes :", data_analysis.get("total_requests", 0))
-            st.write("Logs récents :")
-            st.json(data_analysis.get("logs", []))
+            st.write("Retours utilisateurs :", len(data_analysis.get("feedbacks", [])))
         else:
             st.error("Erreur lors de la récupération des données d'analyse.")
     except Exception as e:
         st.error("Impossible de joindre le backend pour l'analyse.")
     
-    # Affichage des métriques Prometheus sous forme de tableau
     try:
         metrics_url = "http://localhost:8000/metrics"
         metrics_response = requests.get(metrics_url)
         if metrics_response.status_code == 200:
             st.subheader("Métriques Prometheus")
             lines = metrics_response.text.splitlines()
+            definitions = {
+                "request_count": "Nombre total de requêtes reçues par le backend.",
+                "forecast_requests": "Nombre total de demandes de prévisions traitées.",
+                "errors_count": "Nombre d'erreurs survenues lors du traitement des requêtes.",
+                "feedback_count": "Nombre total de retours utilisateurs enregistrés."
+            }
             metrics_data = []
             for line in lines:
                 if line.startswith("#") or line.strip() == "":
@@ -396,19 +456,51 @@ with tab2:
                 parts = line.split()
                 if len(parts) >= 2:
                     metric_name = parts[0]
-                    metric_value = parts[1]
-                    metrics_data.append({"Metric": metric_name, "Value": metric_value})
+                    for key in definitions.keys():
+                        if metric_name.startswith(key):
+                            metric_value = parts[1]
+                            metrics_data.append({"Metric": key, "Value": metric_value})
+                            break
             if metrics_data:
                 df_metrics = pd.DataFrame(metrics_data)
-                st.dataframe(df_metrics)
-                # Ajout des définitions pour chaque métrique
+                # Adapter la taille de la colonne "Value"
+                df_metrics_styled = df_metrics.style.set_properties(subset=["Value"], **{'min-width': '300px'})
+                st.dataframe(df_metrics_styled)
                 st.markdown("**Définitions des métriques :**")
-                st.markdown("- **request_count** : Nombre total de requêtes reçues par le backend.")
-                st.markdown("- **forecast_requests** : Nombre total de demandes de prévisions traitées.")
-                st.markdown("- **errors_count** : Nombre d'erreurs survenues lors du traitement des requêtes.")
+                for key, definition in definitions.items():
+                    st.markdown(f"- **{key}** : {definition}")
             else:
                 st.write("Aucune métrique trouvée.")
         else:
             st.error("Erreur lors de la récupération des métriques Prometheus.")
     except Exception as e:
         st.error("Impossible de joindre l'endpoint /metrics.")
+    
+    try:
+        top_cities_url = "http://localhost:8000/top_cities"
+        response = requests.get(top_cities_url)
+        if response.status_code == 200:
+            st.subheader("Répartition des demandes par ville")
+            top_cities_data = response.json()
+            df_top = pd.DataFrame(list(top_cities_data.items()), columns=["Ville", "Nombre de demandes"])
+            # Adapter la largeur de la colonne "Ville" pour voir le nom en entier
+            st.dataframe(df_top.style.set_properties(subset=["Ville"], **{'min-width': '200px'}))
+        else:
+            st.error("Erreur lors de la récupération des données par ville.")
+    except Exception as e:
+        st.error("Impossible de joindre l'endpoint /top_cities.")
+    
+with tab3:
+    st.header("Feedback")
+    with st.form("feedback_form"):
+        rating = st.slider("Votre note (1-5)", min_value=1, max_value=5, value=3)
+        comment = st.text_area("Votre commentaire (facultatif)")
+        submitted = st.form_submit_button("Envoyer votre feedback")
+        if submitted:
+            feedback_url = "http://localhost:8000/feedback"
+            data = {"rating": rating, "comment": comment}
+            response = requests.post(feedback_url, data=data)
+            if response.status_code == 200:
+                st.success("Merci pour votre feedback !")
+            else:
+                st.error("Erreur lors de l'envoi du feedback.")
