@@ -15,13 +15,13 @@ from pydantic import BaseModel
 import streamlit as st
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, AudioProcessorBase
 
-# Pour le caching et retry lors des appels à Open-Meteo
 import requests_cache
 import pandas as pd
 from retry_requests import retry
 
-# Pour intégrer du code HTML/JS dans Streamlit
-import streamlit.components.v1 as components
+# Pour le graphique interactif
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # -------------------- Setup de la session HTTP avec cache --------------------
 cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
@@ -50,13 +50,13 @@ logging.basicConfig(level=logging.INFO)
 
 # Chargement du modèle spaCy pour le français
 nlp = spacy.load("fr_core_news_sm")
-
-# Stockage en mémoire pour le monitoring (simulation d'une base)
 logs = []
 
+# On ajoute forecast_days dans la réponse
 class WeatherResponse(BaseModel):
     location: str
     forecast: dict
+    forecast_days: int
     message: str = None
     transcription: str = None
 
@@ -65,10 +65,10 @@ async def process_command(
     file: UploadFile = File(None),
     transcription: str = Form(None),
     city: str = Form(None),
-    horizon: str = Form(None)
+    forecast_days: str = Form(None)  # optionnel en mode manuel
 ):
     try:
-        # 1. Transcription (simulation si audio fourni)
+        # Si un fichier audio est fourni, on tente de le transcrire
         if file is not None:
             audio_bytes = await file.read()
             transcription_result = azure_speech_to_text(audio_bytes)
@@ -76,27 +76,31 @@ async def process_command(
         else:
             transcription_final = transcription or ""
         
-        # 2. Extraction automatique via spaCy (ville et horizon)
-        if transcription_final:
-            extracted_city, extracted_horizon = spacy_analyze(transcription_final)
+        # Extraction via spaCy : récupère la ville et le nombre de jours.
+        extracted_city, extracted_days = spacy_analyze(transcription_final)
+        
+        # Priorité à la saisie manuelle pour la ville
+        final_city = city if city else extracted_city
+        
+        # Détermination de la durée de prévision selon le mode
+        if file is not None:
+            # En commande vocale, le nombre de jours extrait est utilisé
+            final_forecast_days = extracted_days
         else:
-            extracted_city, extracted_horizon = (None, None)
+            final_forecast_days = int(forecast_days) if forecast_days is not None else 7
         
-        # 3. Priorité aux saisies manuelles
-        final_city = city if city else (extracted_city if extracted_city else "Paris")
-        final_horizon = horizon if horizon else (extracted_horizon if extracted_horizon else "demain")
-        
-        # 4. Récupération de la prévision météo via Open-Meteo (hourly)
+        # Récupération de la prévision météo
         hourly_dataframe = get_weather_forecast(final_city)
         logging.info(f"Prévision météo récupérée (hourly) pour {final_city}")
         
-        # 5. Stockage dans les logs
-        store_forecast_in_db(transcription_final, final_city, final_horizon, hourly_dataframe)
+        # Stockage dans les logs
+        store_forecast_in_db(transcription_final, final_city, final_forecast_days, hourly_dataframe)
         
         forecast_dict = hourly_dataframe.to_dict(orient="records")
         return WeatherResponse(
             location=final_city,
             forecast={"hourly": forecast_dict},
+            forecast_days=final_forecast_days,
             message="Prévision obtenue avec succès.",
             transcription=transcription_final
         )
@@ -110,27 +114,61 @@ def analysis():
     return {"total_requests": total_requests, "logs": logs}
 
 def azure_speech_to_text(audio_bytes: bytes) -> str:
-    # Simulation d'appel à Azure Speech-to-Text (à remplacer par l'intégration réelle)
-    return "transcrire l'audio: Paris demain"
+    """
+    Ici, la transcription est simulée.
+    Pour un déploiement réel, intégrez la solution Azure Speech-to-Text.
+    La transcription doit inclure la ville et idéalement une mention du nombre de jours, par exemple :
+    "Prévision pour Paris sur 5 jours"
+    """
+    # Simulation améliorée pour le test
+    return "Prévision pour Paris sur 5 jours"
 
 from typing import Tuple
+import re
 
-def spacy_analyze(text: str) -> Tuple[str, str]:
+def spacy_analyze(text: str) -> Tuple[str, int]:
+    """
+    Extrait la ville et le nombre de jours de prévision depuis la commande.
+    Recherche une mention du type "sur 5 jours".
+    Si aucun nombre parmi 3, 5 ou 7 n'est trouvé, renvoie 7 par défaut.
+    """
     doc = nlp(text)
     location = None
-    horizon = None
+    forecast_days = None
+    
+    # Utilisation d'une expression régulière pour détecter "sur <nombre> jours"
+    match = re.search(r"sur\s+(\d+)\s+jours", text, re.IGNORECASE)
+    if match:
+        try:
+            num = int(match.group(1))
+            if num in [3, 5, 7]:
+                forecast_days = num
+        except:
+            pass
+    
+    # Sinon, on parcourt les tokens pour détecter un nombre acceptable
+    if not forecast_days:
+        for token in doc:
+            if token.like_num:
+                try:
+                    num = int(token.text)
+                    if num in [3, 5, 7]:
+                        forecast_days = num
+                        break
+                except:
+                    continue
+                    
+    # Extraction de la ville
     for ent in doc.ents:
         if ent.label_ in ["LOC", "GPE"] and not location:
             location = ent.text
-        elif ent.label_ in ["DATE", "TIME"] and not horizon:
-            horizon = ent.text
+            
     if not location:
         location = "Paris"
-    if not horizon:
-        horizon = "demain"
-    return location, horizon
+    if not forecast_days:
+        forecast_days = 7
+    return location, forecast_days
 
-# -------------------- Géocodage via Nominatim --------------------
 def get_coordinates(city_name: str) -> Tuple[float, float]:
     geocode_url = "https://nominatim.openstreetmap.org/search"
     params = {"q": city_name, "format": "json"}
@@ -143,7 +181,6 @@ def get_coordinates(city_name: str) -> Tuple[float, float]:
     lon = float(data[0]["lon"])
     return lat, lon
 
-# -------------------- Récupération de la prévision météo via Open-Meteo --------------------
 def get_weather_forecast(city_name: str) -> pd.DataFrame:
     lat, lon = get_coordinates(city_name)
     url = "https://api.open-meteo.com/v1/forecast"
@@ -171,12 +208,12 @@ def get_weather_forecast(city_name: str) -> pd.DataFrame:
     print(df)
     return df
 
-def store_forecast_in_db(transcription: str, location: str, horizon: str, forecast_df: pd.DataFrame):
+def store_forecast_in_db(transcription: str, location: str, forecast_days: int, forecast_df: pd.DataFrame):
     entry = {
         "timestamp": datetime.datetime.now().isoformat(),
         "transcription": transcription,
         "city": location,
-        "horizon": horizon,
+        "forecast_days": forecast_days,
         "forecast": forecast_df.to_dict(orient="records")
     }
     logs.append(entry)
@@ -194,8 +231,8 @@ if "backend_started" not in st.session_state:
 # -------------------- Interface Streamlit (Frontend) --------------------
 st.title("Application Météo – Commande vocale / manuelle (Open-Meteo)")
 
-# Onglets de navigation
-tab1, tab2, tab3 = st.tabs(["Prévisions (Python)", "Analyse & Monitoring", "Dashboard HTML/JS"])
+# Deux onglets : Prévisions et Analyse & Monitoring
+tab1, tab2 = st.tabs(["Prévisions (Python)", "Analyse & Monitoring"])
 
 with tab1:
     st.header("Envoi de la commande au backend")
@@ -205,7 +242,10 @@ with tab1:
     audio_bytes = None
     transcription_input = ""
     city_input = ""
-    horizon_input = ""
+    # La zone "Horizon temporel" est supprimée
+    forecast_days_input = None
+    if mode != "Enregistrement par micro":
+        forecast_days_input = st.selectbox("Nombre de jours de prévision", options=[3, 5, 7], index=2)
     
     if mode == "Enregistrement par micro":
         st.subheader("Enregistrement par micro")
@@ -229,8 +269,6 @@ with tab1:
                     st.warning("Aucune donnée audio capturée.")
         transcription_input = st.text_input("Transcription (optionnelle)")
         city_input = st.text_input("Ville (optionnel)")
-        horizon_input = st.text_input("Horizon temporel (optionnel)")
-    
     elif mode == "Charger un fichier audio":
         st.subheader("Charger un fichier audio")
         uploaded_file = st.file_uploader("Sélectionnez votre fichier audio", type=["wav", "mp3"])
@@ -239,12 +277,10 @@ with tab1:
             st.audio(audio_bytes, format="audio/wav")
         transcription_input = st.text_input("Transcription (optionnelle)")
         city_input = st.text_input("Ville (optionnel)")
-        horizon_input = st.text_input("Horizon temporel (optionnel)")
     else:
         st.subheader("Commande manuelle")
         transcription_input = st.text_input("Transcription de la commande (facultatif)")
         city_input = st.text_input("Ville")
-        horizon_input = st.text_input("Horizon temporel (ex. demain, aujourd'hui, etc.)")
     
     if st.button("Envoyer la commande"):
         backend_url = "http://localhost:8000/process_command"
@@ -256,28 +292,47 @@ with tab1:
             data["transcription"] = transcription_input
         if city_input:
             data["city"] = city_input
-        if horizon_input:
-            data["horizon"] = horizon_input
+        # En mode manuel, on envoie le nombre de jours choisi
+        if mode != "Enregistrement par micro" and forecast_days_input is not None:
+            data["forecast_days"] = str(forecast_days_input)
         try:
             response = requests.post(backend_url, files=files, data=data)
             if response.status_code == 200:
                 result = response.json()
                 st.success(f"Prévision pour {result['location']}")
+                final_days = result["forecast_days"]
                 hourly_list = result["forecast"]["hourly"]
                 df = pd.DataFrame(hourly_list)
                 df['date'] = pd.to_datetime(df['date'])
                 df['hour'] = df['date'].dt.hour
-                # Filtrer pour n'afficher que la prévision de midi (12h00) pour 7 jours
-                df_filtered = df[df['hour'] == 12].sort_values(by='date').head(7)
-                st.subheader("Prévisions de Midi sur 7 Jours")
-                cols = st.columns(len(df_filtered))
-                for idx, (_, row) in enumerate(df_filtered.iterrows()):
-                    with cols[idx]:
-                        st.markdown(f"**{row['date'].strftime('%A %d %b')}**")
-                        st.metric(label="🌡️ Température", value=f"{row['temperature_2m']:.1f} °C")
-                        st.metric(label="☁️ Ciel", value=f"{row['cloudcover']:.0f} %")
-                        st.metric(label="💨 Vent", value=f"{row['windspeed_10m']:.1f} km/h")
-                        st.metric(label="😷 Pollution", value=f"{row['pm2_5']:.1f} µg/m³")
+                df_filtered = df[df['hour'] == 12].sort_values(by='date').head(final_days)
+                
+                # Graphique interactif avec Plotly
+                fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                                    subplot_titles=("Température (°C)", "Ciel (%)", "Vent (km/h)"))
+                fig.add_trace(go.Scatter(x=df_filtered['date'], y=df_filtered['temperature_2m'],
+                                         mode='lines+markers', name='Température', marker=dict(color='red')),
+                                         row=1, col=1)
+                fig.add_trace(go.Scatter(x=df_filtered['date'], y=df_filtered['cloudcover'],
+                                         mode='lines+markers', name='Ciel', marker=dict(color='blue')),
+                                         row=2, col=1)
+                fig.add_trace(go.Scatter(x=df_filtered['date'], y=df_filtered['windspeed_10m'],
+                                         mode='lines+markers', name='Vent', marker=dict(color='green')),
+                                         row=3, col=1)
+                fig.update_layout(height=600, title_text="Prévisions de Midi sur {} jours".format(final_days), showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
+                
+                st.subheader("Détails des prévisions")
+                st.dataframe(df_filtered[['date', 'temperature_2m', 'cloudcover', 'windspeed_10m', 'pm2_5']].rename(
+                    columns={
+                        "date": "Date",
+                        "temperature_2m": "Température (°C)",
+                        "cloudcover": "Ciel (%)",
+                        "windspeed_10m": "Vent (km/h)",
+                        "pm2_5": "Pollution (µg/m³)"
+                    }
+                ))
+                
                 if result.get("transcription"):
                     st.write("Transcription utilisée :", result["transcription"])
             else:
@@ -299,120 +354,3 @@ with tab2:
             st.error("Erreur lors de la récupération des données d'analyse.")
     except Exception as e:
         st.error("Impossible de joindre le backend pour l'analyse.")
-    
-with tab3:
-    st.header("Dashboard HTML/JS")
-    # Dashboard autonome en HTML affichant uniquement la prévision de midi pour 7 jours
-    html_dashboard = """
-    <!DOCTYPE html>
-    <html lang="fr">
-      <head>
-        <meta charset="UTF-8" />
-        <title>Dashboard Météo – Prévisions de Midi sur 7 Jours</title>
-        <style>
-          body {
-            font-family: Arial, sans-serif;
-            background: #f0f4f7;
-            margin: 0;
-            padding: 20px;
-          }
-          h1 {
-            text-align: center;
-            color: #333;
-          }
-          #dashboard {
-            display: flex;
-            flex-wrap: wrap;
-            justify-content: center;
-            gap: 20px;
-            margin-top: 20px;
-          }
-          .card {
-            background: #fff;
-            border-radius: 8px;
-            padding: 16px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            width: 180px;
-            text-align: center;
-          }
-          .card h2 {
-            margin: 0 0 10px;
-            font-size: 1.1em;
-            color: #0077cc;
-          }
-          .card p {
-            margin: 6px 0;
-            font-size: 0.95em;
-          }
-        </style>
-      </head>
-      <body>
-        <h1>Prévisions de Midi sur 7 Jours</h1>
-        <div id="dashboard">Chargement des prévisions…</div>
-        <script type="module">
-          import { fetchWeatherApi } from 'https://cdn.jsdelivr.net/npm/openmeteo@1.0.2/dist/openmeteo.mjs';
-          // Fonction utilitaire pour générer une plage de nombres
-          const range = (start, stop, step) =>
-            Array.from({ length: Math.floor((stop - start) / step) }, (_, i) => start + i * step);
-          async function main() {
-            // Paramètres pour récupérer les prévisions horaires depuis Open-Meteo pour Paris
-            const params = {
-              latitude: 48.8534,
-              longitude: 2.3488,
-              hourly: ["temperature_2m", "cloudcover", "windspeed_10m"],
-              timezone: "auto"
-            };
-            const url = "https://api.open-meteo.com/v1/forecast";
-            const responses = await fetchWeatherApi(url, params);
-            const response = responses[0];
-            const utcOffsetSeconds = response.utcOffsetSeconds();
-            const hourly = response.hourly();
-            const interval = hourly.interval();
-            const startTime = Number(hourly.time());
-            const endTime = Number(hourly.timeEnd());
-            const times = range(startTime, endTime, interval).map(
-              t => new Date((t + utcOffsetSeconds) * 1000)
-            );
-            const hourlyTemp = hourly.variables(0).valuesArray();
-            const hourlyCloudCover = hourly.variables(1).valuesArray();
-            const hourlyWind = hourly.variables(2).valuesArray();
-            // Filtrer pour obtenir uniquement la prévision pour midi (12h00)
-            const forecasts = {};
-            for (let i = 0; i < times.length; i++) {
-              if (times[i].getHours() === 12) {
-                const dateKey = times[i].toISOString().split("T")[0];
-                forecasts[dateKey] = {
-                  time: times[i],
-                  temperature: hourlyTemp[i],
-                  cloudCover: hourlyCloudCover[i],
-                  windSpeed: hourlyWind[i]
-                };
-              }
-            }
-            // Transformer l'objet en tableau et ne garder que les 7 premiers jours
-            const forecastArray = Object.values(forecasts).slice(0, 7);
-            const dashboardDiv = document.getElementById("dashboard");
-            dashboardDiv.innerHTML = "";
-            forecastArray.forEach(forecast => {
-              const card = document.createElement("div");
-              card.className = "card";
-              const options = { weekday: 'long', day: 'numeric', month: 'short' };
-              const dateStr = forecast.time.toLocaleDateString("fr-FR", options);
-              card.innerHTML = `
-                <h2>${dateStr}</h2>
-                <p>🌡️ Température : ${forecast.temperature} °C</p>
-                <p>☁️ Ciel : ${forecast.cloudCover} %</p>
-                <p>💨 Vent : ${forecast.windSpeed} km/h</p>
-              `;
-              dashboardDiv.appendChild(card);
-            });
-          }
-          main().catch(error => {
-            console.error("Erreur dans le dashboard :", error);
-            document.getElementById("dashboard").innerText = "Erreur de chargement des prévisions.";
-          });
-        </script>
-      </body>
-    </html>
-    """
-    components.html(html_dashboard, height=600, scrolling=True)
