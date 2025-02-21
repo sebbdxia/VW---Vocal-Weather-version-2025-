@@ -1,4 +1,6 @@
+#!/usr/bin/env python
 import os
+import json
 import datetime
 import logging
 import spacy
@@ -8,46 +10,67 @@ import threading
 import time
 import re
 import tempfile
-import json
 from typing import Tuple, Callable
 from functools import wraps
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Response, Request
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import streamlit as st
-
 import requests_cache
 import pandas as pd
 from retry_requests import retry
 
-# Pour le graphique interactif
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-# Charger les variables d'environnement (fichier .env)
 from dotenv import load_dotenv
 load_dotenv('.env')
 
-# -------------------- Configuration PostgreSQL (Azure) --------------------
+# Configuration de la base de données et des métriques Prometheus
 DB_USER = os.getenv("DB_USER", "sebastien")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "GRETAP4!2025***")
 DB_HOST = os.getenv("DB_HOST", "vw-sebastien.postgres.database.azure.com")
 DB_NAME = os.getenv("DB_NAME", "postgres")
 
-# -------------------- Création d'un registre Prometheus personnalisé --------------------
-from prometheus_client import CollectorRegistry, Counter, Histogram, generate_latest
+from prometheus_client import CollectorRegistry, Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 prom_registry = CollectorRegistry(auto_describe=True)
-REQUEST_COUNT = Counter("request_count", "Total number of requests", registry=prom_registry)
-FORECAST_REQUESTS = Counter("forecast_requests", "Number of forecast requests", registry=prom_registry)
-ERRORS_COUNT = Counter("errors_count", "Number of errors", registry=prom_registry)
-REQUEST_LATENCY = Histogram("request_latency_seconds", "Request latency in seconds", registry=prom_registry)
 
-# -------------------- Setup de la session HTTP avec cache --------------------
+# Définition de métriques HTTP globales avec labels pour une instrumentation fine
+REQUEST_COUNT = Counter(
+    "http_requests_total",
+    "Nombre total de requêtes HTTP",
+    ["method", "endpoint", "http_status"],
+    registry=prom_registry
+)
+REQUEST_LATENCY = Histogram(
+    "http_request_duration_seconds",
+    "Durée des requêtes HTTP (en secondes)",
+    ["method", "endpoint"],
+    registry=prom_registry
+)
+
+# Autres métriques spécifiques
+FORECAST_REQUESTS = Counter(
+    "forecast_requests_total",
+    "Nombre total de demandes de prévisions traitées",
+    registry=prom_registry
+)
+ERRORS_COUNT = Counter(
+    "errors_total",
+    "Nombre total d'erreurs survenues",
+    registry=prom_registry
+)
+FEEDBACK_COUNT = Counter(
+    "feedback_total",
+    "Nombre total de retours utilisateurs enregistrés",
+    registry=prom_registry
+)
+
 cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
 retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
 
-# -------------------- Backend FastAPI --------------------
 SPEECH_KEY = os.environ.get("SPEECH_KEY")
 SPEECH_REGION = os.environ.get("SPEECH_REGION")
 
@@ -55,17 +78,29 @@ app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
 nlp = spacy.load("fr_core_news_sm")
-logs = []            # Logs des commandes
-user_feedbacks = []  # Retours utilisateurs
+logs = []            
+user_feedbacks = []
 
-# Décorateur pour mesurer la latence
+# Middleware pour instrumenter automatiquement toutes les requêtes HTTP
+@app.middleware("http")
+async def prometheus_middleware(request: Request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    elapsed_time = time.time() - start_time
+    path = request.url.path
+    method = request.method
+    status = response.status_code
+    REQUEST_COUNT.labels(method=method, endpoint=path, http_status=status).inc()
+    REQUEST_LATENCY.labels(method=method, endpoint=path).observe(elapsed_time)
+    return response
+
 def measure_latency(func: Callable):
     @wraps(func)
     async def wrapper(*args, **kwargs):
         start = time.time()
         result = await func(*args, **kwargs)
         elapsed = time.time() - start
-        REQUEST_LATENCY.observe(elapsed)
+        # Mesure complémentaire si besoin
         return result
     return wrapper
 
@@ -83,9 +118,8 @@ async def process_command(
     file: UploadFile = File(None),
     transcription: str = Form(None),
     city: str = Form(None),
-    forecast_days: str = Form(None)  # renseigné en mode manuel
+    forecast_days: str = Form(None)
 ):
-    REQUEST_COUNT.inc()
     try:
         if file is not None:
             audio_bytes = await file.read()
@@ -128,8 +162,12 @@ def analysis():
 
 @app.get("/metrics")
 def metrics():
-    content = generate_latest(prom_registry)
-    return Response(content=content, media_type="text/plain; version=0.0.4")
+    try:
+        data = generate_latest(prom_registry)
+        return Response(content=data, media_type=CONTENT_TYPE_LATEST)
+    except Exception as e:
+        logging.error("Erreur lors de l'exposition des métriques", exc_info=True)
+        raise HTTPException(status_code=500, detail="Erreur lors de l'exposition des métriques")
 
 @app.get("/top_cities")
 def top_cities():
@@ -151,6 +189,7 @@ def feedback(rating: int = Form(...), comment: str = Form("")):
         "comment": comment
     }
     user_feedbacks.append(entry)
+    FEEDBACK_COUNT.inc()
     try:
         import psycopg2
         conn = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST)
@@ -314,13 +353,12 @@ if "backend_started" not in st.session_state:
     threading.Thread(target=run_backend, daemon=True).start()
     time.sleep(1)
 
-# -------------------- Interface Streamlit --------------------
 st.title("Application Météo – Commande vocale / manuelle (Open-Meteo)")
 
 if "forecast_response" not in st.session_state:
-    st.session_state.forecast_response = None
+    st.session_state["forecast_response"] = None
 
-# Création de trois onglets : Prévisions, Analyse & Monitoring, Feedback
+# Définition de trois onglets : Prévisions, Analyse & Monitoring, Feedback
 tab1, tab2, tab3 = st.tabs(["Prévisions", "Analyse & Monitoring", "Feedback"])
 
 with tab1:
@@ -429,7 +467,7 @@ with tab1:
             st.error(f"Impossible d'afficher la carte: {e}")
         if result.get("transcription"):
             st.write("Transcription utilisée :", result["transcription"])
-        
+
 with tab2:
     st.header("Analyse et Monitoring")
     try:
@@ -451,23 +489,21 @@ with tab2:
             st.subheader("Métriques Prometheus")
             lines = metrics_response.text.splitlines()
             definitions = {
-                "request_count": "Nombre total de requêtes reçues par le backend.",
-                "forecast_requests": "Nombre total de demandes de prévisions traitées.",
-                "errors_count": "Nombre d'erreurs survenues lors du traitement des requêtes.",
-                "feedback_count": "Nombre total de retours utilisateurs enregistrés."
+                "http_requests_total": "Nombre total de requêtes HTTP, ventilées par méthode, endpoint et code HTTP.",
+                "http_request_duration_seconds": "Durée des requêtes HTTP par méthode et endpoint.",
+                "forecast_requests_total": "Nombre total de demandes de prévisions traitées.",
+                "errors_total": "Nombre total d'erreurs survenues.",
+                "feedback_total": "Nombre total de retours utilisateurs enregistrés."
             }
             metrics_data = []
-            for line in lines:
-                if line.startswith("#") or line.strip() == "":
-                    continue
-                parts = line.split()
-                if len(parts) >= 2:
-                    metric_name = parts[0]
-                    for key in definitions.keys():
-                        if metric_name.startswith(key):
+            for key, definition in definitions.items():
+                for line in lines:
+                    if line.startswith(key):
+                        parts = line.split()
+                        if len(parts) >= 2:
                             metric_value = parts[1]
                             metrics_data.append({"Metric": key, "Value": metric_value})
-                            break
+                        break
             if metrics_data:
                 df_metrics = pd.DataFrame(metrics_data)
                 df_metrics_styled = df_metrics.style.set_properties(subset=["Value"], **{'min-width': '300px'})
@@ -489,12 +525,19 @@ with tab2:
             st.subheader("Répartition des demandes par ville")
             top_cities_data = response.json()
             df_top = pd.DataFrame(list(top_cities_data.items()), columns=["Ville", "Nombre de demandes"])
-            st.dataframe(df_top.style.set_properties(subset=["Ville"], **{'min-width': '200px'}))
+            df_top = df_top.sort_values(by="Nombre de demandes", ascending=False)
+            st.dataframe(df_top.style.set_properties(**{'text-align': 'center', 'min-width': '200px'}))
+            fig = go.Figure(data=[go.Bar(x=df_top["Ville"], y=df_top["Nombre de demandes"], marker_color='indianred')])
+            fig.update_layout(title="Nombre de demandes par ville",
+                              xaxis_title="Ville",
+                              yaxis_title="Nombre de demandes",
+                              template="plotly_white")
+            st.plotly_chart(fig, use_container_width=True)
         else:
             st.error("Erreur lors de la récupération des données par ville.")
     except Exception as e:
         st.error("Impossible de joindre l'endpoint /top_cities.")
-    
+
 with tab3:
     st.header("Feedback")
     with st.form("feedback_form"):
