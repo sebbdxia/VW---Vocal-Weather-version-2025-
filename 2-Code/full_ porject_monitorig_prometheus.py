@@ -28,16 +28,27 @@ from plotly.subplots import make_subplots
 from dotenv import load_dotenv
 load_dotenv('.env')
 
-# Configuration de la base de données et des métriques Prometheus
+# ─────────────── Intégration d'OpenTelemetry pour la traçabilité distribuée ───────────────
+from opentelemetry import trace
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+
+resource = Resource(attributes={"service.name": "weather-app"})
+trace.set_tracer_provider(TracerProvider(resource=resource))
+tracer = trace.get_tracer(__name__)
+span_processor = BatchSpanProcessor(ConsoleSpanExporter())
+trace.get_tracer_provider().add_span_processor(span_processor)
+
+# ─────────────── Configuration de la base de données et des métriques Prometheus ───────────────
 DB_USER = os.getenv("DB_USER", "sebastien")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "GRETAP4!2025***")
 DB_HOST = os.getenv("DB_HOST", "vw-sebastien.postgres.database.azure.com")
 DB_NAME = os.getenv("DB_NAME", "postgres")
 
-from prometheus_client import CollectorRegistry, Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import CollectorRegistry, Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 prom_registry = CollectorRegistry(auto_describe=True)
 
-# Définition de métriques HTTP globales avec labels pour une instrumentation fine
 REQUEST_COUNT = Counter(
     "http_requests_total",
     "Nombre total de requêtes HTTP",
@@ -51,7 +62,6 @@ REQUEST_LATENCY = Histogram(
     registry=prom_registry
 )
 
-# Autres métriques spécifiques
 FORECAST_REQUESTS = Counter(
     "forecast_requests_total",
     "Nombre total de demandes de prévisions traitées",
@@ -67,21 +77,41 @@ FEEDBACK_COUNT = Counter(
     "Nombre total de retours utilisateurs enregistrés",
     registry=prom_registry
 )
+# Nouveau Gauge pour le taux d'erreur par endpoint
+HTTP_ERROR_RATE = Gauge(
+    "http_error_rate",
+    "Taux d'erreur HTTP par endpoint",
+    ["endpoint"],
+    registry=prom_registry
+)
 
+# ─────────────── Centralisation des logs ───────────────
+logging.basicConfig(level=logging.INFO)
+file_handler = logging.FileHandler("aggregated_logs.log")
+file_handler.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(formatter)
+logging.getLogger().addHandler(file_handler)
+
+# Sessions en cache et reprise automatique des requêtes HTTP
 cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
 retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
 
+# Clés d'accès au service de transcription vocale Azure
 SPEECH_KEY = os.environ.get("SPEECH_KEY")
 SPEECH_REGION = os.environ.get("SPEECH_REGION")
 
+# Variables globales pour logs, feedback et statistiques par endpoint
 app = FastAPI()
-logging.basicConfig(level=logging.INFO)
-
 nlp = spacy.load("fr_core_news_sm")
 logs = []            
 user_feedbacks = []
 
-# Middleware pour instrumenter automatiquement toutes les requêtes HTTP
+# Structure pour stocker le nombre total de requêtes et d'erreurs par endpoint
+endpoint_stats = {}  # Exemple: {"/process_command": {"total": 10, "errors": 2}, ...}
+alerts = []  # Liste des alertes générées
+
+# ─────────────── Middleware pour instrumentation et collecte fine ───────────────
 @app.middleware("http")
 async def prometheus_middleware(request: Request, call_next):
     start_time = time.time()
@@ -92,18 +122,36 @@ async def prometheus_middleware(request: Request, call_next):
     status = response.status_code
     REQUEST_COUNT.labels(method=method, endpoint=path, http_status=status).inc()
     REQUEST_LATENCY.labels(method=method, endpoint=path).observe(elapsed_time)
+    
+    # Mise à jour des statistiques par endpoint pour le calcul du taux d'erreur
+    if path not in endpoint_stats:
+         endpoint_stats[path] = {"total": 0, "errors": 0}
+    endpoint_stats[path]["total"] += 1
+    if status >= 400:
+         endpoint_stats[path]["errors"] += 1
+         ERRORS_COUNT.inc()
+    # Mise à jour du Gauge pour chaque endpoint
+    for ep, stats in endpoint_stats.items():
+         error_rate = stats["errors"] / stats["total"] if stats["total"] > 0 else 0
+         HTTP_ERROR_RATE.labels(endpoint=ep).set(error_rate)
+    
     return response
 
+# ─────────────── Décorateur pour mesurer la latence et créer des spans OpenTelemetry ───────────────
 def measure_latency(func: Callable):
     @wraps(func)
     async def wrapper(*args, **kwargs):
         start = time.time()
-        result = await func(*args, **kwargs)
+        # Création d'un span pour la fonction décorée
+        with tracer.start_as_current_span(func.__name__):
+            result = await func(*args, **kwargs)
         elapsed = time.time() - start
-        # Mesure complémentaire si besoin
+        # La mesure peut être loguée ou envoyée vers une autre métrique si besoin
+        logging.info(f"Temps d'exécution de {func.__name__}: {elapsed:.3f} secondes")
         return result
     return wrapper
 
+# ─────────────── Modèle de réponse et endpoints de l'API ───────────────
 class WeatherResponse(BaseModel):
     location: str
     forecast: dict
@@ -152,7 +200,6 @@ async def process_command(
             mode="vocale" if file is not None else "manuel"
         )
     except Exception as e:
-        ERRORS_COUNT.inc()
         logging.error("Erreur lors du traitement de la commande", exc_info=True)
         raise HTTPException(status_code=500, detail="Erreur lors du traitement de la commande")
 
@@ -213,6 +260,7 @@ def feedback(rating: int = Form(...), comment: str = Form("")):
         logging.error(f"Erreur lors du stockage du feedback PostgreSQL: {e}")
     return {"status": "Feedback enregistré"}
 
+# ─────────────── Fonctions de traitement et intégration externe ───────────────
 def azure_speech_to_text(audio_bytes: bytes = None) -> str:
     import azure.cognitiveservices.speech as speechsdk
     speech_config = speechsdk.SpeechConfig(subscription=SPEECH_KEY, region=SPEECH_REGION)
@@ -345,6 +393,17 @@ def store_forecast_in_db(transcription: str, location: str, forecast_days: int, 
     except Exception as e:
         logging.error(f"Erreur lors du stockage PostgreSQL: {e}")
 
+# ─────────────── Fonction de vérification et génération d'alertes ───────────────
+def check_alerts():
+    global alerts
+    alerts.clear()
+    threshold = 0.1  # Seuil fixé à 10%
+    for ep, stats in endpoint_stats.items():
+         error_rate = stats["errors"] / stats["total"] if stats["total"] > 0 else 0
+         if error_rate > threshold:
+              alerts.append(f"Attention : Taux d'erreur élevé sur {ep} ({error_rate:.2%})")
+
+# ─────────────── Démarrage du Backend et intégration avec l'interface Streamlit ───────────────
 def run_backend():
     uvicorn.run(app, host="0.0.0.0", port=8000)
 
@@ -358,7 +417,7 @@ st.title("Application Météo – Commande vocale / manuelle (Open-Meteo)")
 if "forecast_response" not in st.session_state:
     st.session_state["forecast_response"] = None
 
-# Définition de trois onglets : Prévisions, Analyse & Monitoring, Feedback
+# Construction de l'interface en trois onglets.
 tab1, tab2, tab3 = st.tabs(["Prévisions", "Analyse & Monitoring", "Feedback"])
 
 with tab1:
@@ -469,7 +528,7 @@ with tab1:
             st.write("Transcription utilisée :", result["transcription"])
 
 with tab2:
-    st.header("Analyse et Monitoring")
+    st.header("Analyse & Monitoring")
     try:
         analysis_url = "http://localhost:8000/analysis"
         response = requests.get(analysis_url)
@@ -493,7 +552,8 @@ with tab2:
                 "http_request_duration_seconds": "Durée des requêtes HTTP par méthode et endpoint.",
                 "forecast_requests_total": "Nombre total de demandes de prévisions traitées.",
                 "errors_total": "Nombre total d'erreurs survenues.",
-                "feedback_total": "Nombre total de retours utilisateurs enregistrés."
+                "feedback_total": "Nombre total de retours utilisateurs enregistrés.",
+                "http_error_rate": "Taux d'erreur HTTP par endpoint."
             }
             metrics_data = []
             for key, definition in definitions.items():
@@ -518,25 +578,41 @@ with tab2:
     except Exception as e:
         st.error("Impossible de joindre l'endpoint /metrics.")
     
+    # ───── Affichage des alertes générées ─────
+    st.subheader("Alertes")
+    check_alerts()
+    if alerts:
+        for alert in alerts:
+            st.error(alert)
+    else:
+        st.success("Aucune alerte détectée.")
+    
+    # ───── Affichage du taux d'erreur par endpoint ─────
+    st.subheader("Taux d'erreur par endpoint")
+    data_error_rate = []
+    for ep, stats in endpoint_stats.items():
+         error_rate = stats["errors"] / stats["total"] if stats["total"] > 0 else 0
+         data_error_rate.append({
+             "Endpoint": ep,
+             "Total Requests": stats["total"],
+             "Errors": stats["errors"],
+             "Error Rate": f"{error_rate:.2%}"
+         })
+    if data_error_rate:
+         df_error = pd.DataFrame(data_error_rate)
+         st.dataframe(df_error)
+    else:
+         st.write("Aucune donnée d'erreur disponible.")
+    
+    # ───── Affichage des logs centralisés (les 10 dernières lignes) ─────
+    st.subheader("Logs centralisés")
     try:
-        top_cities_url = "http://localhost:8000/top_cities"
-        response = requests.get(top_cities_url)
-        if response.status_code == 200:
-            st.subheader("Répartition des demandes par ville")
-            top_cities_data = response.json()
-            df_top = pd.DataFrame(list(top_cities_data.items()), columns=["Ville", "Nombre de demandes"])
-            df_top = df_top.sort_values(by="Nombre de demandes", ascending=False)
-            st.dataframe(df_top.style.set_properties(**{'text-align': 'center', 'min-width': '200px'}))
-            fig = go.Figure(data=[go.Bar(x=df_top["Ville"], y=df_top["Nombre de demandes"], marker_color='indianred')])
-            fig.update_layout(title="Nombre de demandes par ville",
-                              xaxis_title="Ville",
-                              yaxis_title="Nombre de demandes",
-                              template="plotly_white")
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.error("Erreur lors de la récupération des données par ville.")
+        with open("aggregated_logs.log", "r") as f:
+             logs_content = f.read().splitlines()[-10:]
+        for line in logs_content:
+             st.text(line)
     except Exception as e:
-        st.error("Impossible de joindre l'endpoint /top_cities.")
+        st.error("Impossible de lire les logs centralisés.")
 
 with tab3:
     st.header("Feedback")
