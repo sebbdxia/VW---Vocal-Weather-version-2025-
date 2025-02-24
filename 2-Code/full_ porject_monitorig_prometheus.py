@@ -142,11 +142,9 @@ def measure_latency(func: Callable):
     @wraps(func)
     async def wrapper(*args, **kwargs):
         start = time.time()
-        # Création d'un span pour la fonction décorée
         with tracer.start_as_current_span(func.__name__):
             result = await func(*args, **kwargs)
         elapsed = time.time() - start
-        # La mesure peut être loguée ou envoyée vers une autre métrique si besoin
         logging.info(f"Temps d'exécution de {func.__name__}: {elapsed:.3f} secondes")
         return result
     return wrapper
@@ -578,7 +576,7 @@ with tab2:
     except Exception as e:
         st.error("Impossible de joindre l'endpoint /metrics.")
     
-    # ───── Affichage des alertes générées ─────
+    # Affichage des alertes générées
     st.subheader("Alertes")
     check_alerts()
     if alerts:
@@ -587,7 +585,7 @@ with tab2:
     else:
         st.success("Aucune alerte détectée.")
     
-    # ───── Affichage du taux d'erreur par endpoint ─────
+    # Affichage du taux d'erreur par endpoint
     st.subheader("Taux d'erreur par endpoint")
     data_error_rate = []
     for ep, stats in endpoint_stats.items():
@@ -604,7 +602,7 @@ with tab2:
     else:
          st.write("Aucune donnée d'erreur disponible.")
     
-    # ───── Affichage des logs centralisés (les 10 dernières lignes) ─────
+    # Affichage des logs centralisés (les 10 dernières lignes)
     st.subheader("Logs centralisés")
     try:
         with open("aggregated_logs.log", "r") as f:
@@ -616,6 +614,7 @@ with tab2:
 
 with tab3:
     st.header("Feedback")
+    # Formulaire de saisie de feedback
     with st.form("feedback_form"):
         rating = st.slider("Votre note (1-5)", min_value=1, max_value=5, value=3)
         comment = st.text_area("Votre commentaire (facultatif)")
@@ -628,3 +627,39 @@ with tab3:
                 st.success("Merci pour votre feedback !")
             else:
                 st.error("Erreur lors de l'envoi du feedback.")
+
+    # Récupération et affichage des feedbacks existants
+    try:
+        feedbacks_response = requests.get("http://localhost:8000/feedbacks")
+        if feedbacks_response.status_code == 200:
+            feedbacks = feedbacks_response.json()
+            if feedbacks:
+                # Calcul de la note moyenne
+                average_rating = sum(fb["rating"] for fb in feedbacks) / len(feedbacks)
+                st.markdown(f"**Note moyenne : {average_rating:.2f} / 5**")
+                
+                # Visualisation de la répartition des notes
+                df_feedbacks = pd.DataFrame(feedbacks)
+                rating_counts = df_feedbacks["rating"].value_counts().sort_index()
+                fig = go.Figure(data=go.Bar(
+                    x=rating_counts.index.astype(str),
+                    y=rating_counts.values,
+                    marker_color="indianred"
+                ))
+                fig.update_layout(
+                    title="Répartition des notes",
+                    xaxis_title="Note",
+                    yaxis_title="Nombre de feedbacks",
+                    template="plotly_white"
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Affichage détaillé des commentaires
+                st.subheader("Détails des feedbacks")
+                st.dataframe(df_feedbacks[["timestamp", "rating", "comment"]])
+            else:
+                st.info("Aucun feedback enregistré pour le moment.")
+        else:
+            st.error("Erreur lors de la récupération des feedbacks.")
+    except Exception as e:
+        st.error(f"Erreur lors de la connexion au backend pour les feedbacks: {e}")
