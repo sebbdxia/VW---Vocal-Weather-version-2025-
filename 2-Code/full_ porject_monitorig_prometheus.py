@@ -154,6 +154,7 @@ class WeatherResponse(BaseModel):
     location: str
     forecast: dict
     forecast_days: int
+    forecast_offset: int = 0  # Nouveau champ pour le décalage (0 = aujourd'hui, 1 = demain)
     message: str = None
     transcription: str = None
     mode: str = None
@@ -174,14 +175,17 @@ async def process_command(
         else:
             transcription_final = transcription or ""
         
-        extracted_city, extracted_days = spacy_analyze(transcription_final)
-        logging.info(f"Extraction: Ville='{extracted_city}', Jours='{extracted_days}'")
+        # Analyse de la commande avec prise en compte des mots-clés "aujourd'hui" et "demain"
+        extracted_city, extracted_days, extracted_offset = spacy_analyze(transcription_final)
+        logging.info(f"Extraction: Ville='{extracted_city}', Jours='{extracted_days}', Offset='{extracted_offset}'")
         final_city = city if city else extracted_city
         
         if (file is not None) or (transcription_final and not forecast_days):
             final_forecast_days = extracted_days
+            final_forecast_offset = extracted_offset
         else:
             final_forecast_days = int(forecast_days) if forecast_days is not None else 7
+            final_forecast_offset = 0
         
         hourly_dataframe = get_weather_forecast(final_city)
         logging.info(f"Prévision météo récupérée pour {final_city}")
@@ -193,6 +197,7 @@ async def process_command(
             location=final_city,
             forecast={"hourly": forecast_dict},
             forecast_days=final_forecast_days,
+            forecast_offset=final_forecast_offset,
             message="Prévision obtenue avec succès.",
             transcription=transcription_final,
             mode="vocale" if file is not None else "manuel"
@@ -293,36 +298,54 @@ def azure_speech_from_microphone() -> str:
     else:
         return ""
 
-def spacy_analyze(text: str) -> Tuple[str, int]:
+def spacy_analyze(text: str) -> Tuple[str, int, int]:
     doc = nlp(text)
     location = None
     forecast_days = None
-    match = re.search(r"sur\s+(\d+)\s+jours", text, re.IGNORECASE)
-    if match:
-        try:
-            num = int(match.group(1))
-            if num in [3, 5, 7]:
-                forecast_days = num
-        except Exception as e:
-            logging.error(f"Erreur extraction jours: {e}")
-    if not forecast_days:
-        for token in doc:
-            if token.like_num:
-                try:
-                    num = int(token.text)
-                    if num in [3, 5, 7]:
-                        forecast_days = num
-                        break
-                except:
-                    continue
+    offset = 0
+    lower_text = text.lower()
+    # Prise en compte des mots-clés pour "aujourd'hui" et "demain"
+    if "aujourd'hui" in lower_text and "demain" in lower_text:
+         forecast_days = 2
+         offset = 0
+    elif "aujourd'hui" in lower_text:
+         forecast_days = 1
+         offset = 0
+    elif "demain" in lower_text:
+         forecast_days = 1
+         offset = 1  # Décalage pour afficher la prévision de demain uniquement.
+    
+    # Recherche de pattern numérique si aucun mot-clé n'est détecté
+    if forecast_days is None:
+         match = re.search(r"sur\s+(\d+)\s+jours", text, re.IGNORECASE)
+         if match:
+             try:
+                 num = int(match.group(1))
+                 if num in [3, 5, 7]:
+                     forecast_days = num
+                     offset = 0
+             except Exception as e:
+                 logging.error(f"Erreur extraction jours: {e}")
+    if forecast_days is None:
+         for token in doc:
+             if token.like_num:
+                 try:
+                     num = int(token.text)
+                     if num in [3, 5, 7]:
+                         forecast_days = num
+                         offset = 0
+                         break
+                 except:
+                     continue
     for ent in doc.ents:
-        if ent.label_ in ["LOC", "GPE"] and not location:
-            location = ent.text
+         if ent.label_ in ["LOC", "GPE"] and not location:
+              location = ent.text
     if not location:
-        location = "Paris"
-    if not forecast_days:
-        forecast_days = 7
-    return location, forecast_days
+         location = "Paris"
+    if forecast_days is None:
+         forecast_days = 7
+         offset = 0
+    return location, forecast_days, offset
 
 def get_coordinates(city_name: str) -> Tuple[float, float]:
     geocode_url = "https://nominatim.openstreetmap.org/search"
@@ -452,11 +475,9 @@ with tab1:
         if uploaded_file is not None:
             audio_bytes = uploaded_file.getvalue()
             st.audio(audio_bytes, format="audio/wav")
-        transcription_input = st.text_input("Transcription (optionnelle)")
-        city_input = st.text_input("Ville (optionnel)")
-    else:
-        st.subheader("Commande manuelle")
-        city_input = st.text_input("Ville")
+        else:
+            st.subheader("Commande manuelle")
+        
     
     if mode != "Enregistrement par micro" and st.button("Envoyer la commande"):
         backend_url = "http://localhost:8000/process_command"
@@ -486,10 +507,16 @@ with tab1:
         result = st.session_state.forecast_response
         st.subheader("Prévisions actuelles")
         final_days = result["forecast_days"]
+        offset = result.get("forecast_offset", 0)
         df = pd.DataFrame(result["forecast"]["hourly"])
         df['date'] = pd.to_datetime(df['date'])
         df['hour'] = df['date'].dt.hour
-        df_filtered = df[df['hour'] == 12].sort_values(by='date').head(final_days)
+        # Filtre sur l'heure de midi puis application du décalage
+        df_filtered = df[df['hour'] == 12].sort_values(by='date')
+        if offset > 0:
+            df_filtered = df_filtered.iloc[offset:offset+final_days]
+        else:
+            df_filtered = df_filtered.head(final_days)
         
         fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08,
                             subplot_titles=("Température (°C)", "Ciel (%)", "Vent (km/h)"))
