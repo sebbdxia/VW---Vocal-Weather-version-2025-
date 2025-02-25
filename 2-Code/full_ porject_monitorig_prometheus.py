@@ -24,8 +24,6 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from dotenv import load_dotenv
-
-# Load environment variables from .env file
 load_dotenv(os.path.join(os.path.dirname(__file__), '../.env'))
 
 # Configuration PostgreSQL (Azure)
@@ -38,7 +36,7 @@ DB_NAME = os.getenv("DB_NAME", "postgres")
 SPEECH_KEY = os.environ.get("SPEECH_KEY")
 SPEECH_REGION = os.environ.get("SPEECH_REGION")
 
-# Configuration Prometheus personnalisé
+# Création d'un registre Prometheus personnalisé et ajout des collecteurs système
 from prometheus_client import CollectorRegistry, Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 prom_registry = CollectorRegistry(auto_describe=True)
 REQUEST_COUNT = Counter("http_requests_total", "Nombre total de requêtes HTTP", ["method", "endpoint", "http_status"], registry=prom_registry)
@@ -46,6 +44,11 @@ REQUEST_LATENCY = Histogram("http_request_duration_seconds", "Durée des requêt
 FORECAST_REQUESTS = Counter("forecast_requests_total", "Nombre total de demandes de prévisions traitées", registry=prom_registry)
 ERRORS_COUNT = Counter("errors_total", "Nombre total d'erreurs survenues", registry=prom_registry)
 FEEDBACK_COUNT = Counter("feedback_total", "Nombre total de retours utilisateurs enregistrés", registry=prom_registry)
+
+from prometheus_client import PROCESS_COLLECTOR, PLATFORM_COLLECTOR, GC_COLLECTOR
+prom_registry.register(PROCESS_COLLECTOR)
+prom_registry.register(PLATFORM_COLLECTOR)
+prom_registry.register(GC_COLLECTOR)
 
 # Session HTTP avec cache et mécanisme de retry
 cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
@@ -219,36 +222,37 @@ def azure_speech_from_microphone() -> str:
     
     speech_config = speechsdk.SpeechConfig(subscription=SPEECH_KEY, region=SPEECH_REGION)
     speech_config.speech_recognition_language = "fr-FR"
+    # Reconnaissance continue pour une meilleure qualité de transcription
     audio_config = speechsdk.audio.AudioConfig(use_default_microphone=True)
     speech_recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
-    st.info("Veuillez parler... (attendez la fin de l'enregistrement)")
+    st.info("Veuillez parler... (enregistrement continu pendant 10 secondes)")
     
-    # Ajout d'un délai pour laisser le temps à la connexion de s'établir
-    import time
-    time.sleep(3)
+    result_texts = []
+    def recognized_cb(evt):
+        if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech:
+            result_texts.append(evt.result.text)
+    def stop_cb(evt):
+        st.info("Fin de l'enregistrement.")
     
-    retry_attempts = 3
-    for attempt in range(retry_attempts):
-        result = speech_recognizer.recognize_once_async().get()
-        if result.reason == speechsdk.ResultReason.RecognizedSpeech:
-            return result.text
-        elif result.reason == speechsdk.ResultReason.Canceled:
-            details = result.cancellation_details
-            logging.error(f"Enregistrement annulé: {details.reason}. Détails: {details.error_details}")
-            if attempt < retry_attempts - 1:
-                logging.info(f"Retrying... ({attempt + 1}/{retry_attempts})")
-                time.sleep(2)  # Wait before retrying
-            else:
-                return ""
-        else:
-            logging.error(f"Erreur de reconnaissance vocale: {result.reason}")
-            return ""
+    speech_recognizer.recognized.connect(recognized_cb)
+    speech_recognizer.session_stopped.connect(stop_cb)
+    speech_recognizer.canceled.connect(stop_cb)
+    
+    speech_recognizer.start_continuous_recognition()
+    time.sleep(10)
+    speech_recognizer.stop_continuous_recognition()
+    
+    final_text = " ".join(result_texts)
+    if not final_text:
+        logging.error("Aucune parole détectée lors de l'enregistrement continu.")
+    return final_text
 
 def spacy_analyze(text: str) -> Tuple[str, int]:
     doc = nlp(text)
     location = None
     forecast_days = None
-    regex_match = re.search(r"sur\s+(\d+)\s+jours", text, re.IGNORECASE)
+    # Recherche des motifs "sur X jours" ou "pour X jours"
+    regex_match = re.search(r"(?:sur|pour)\s+(\d+)\s+jours", text, re.IGNORECASE)
     if regex_match:
         try:
             num = int(regex_match.group(1))
@@ -355,19 +359,16 @@ st.title("Application Météo – Commande vocale et manuelle (Open-Meteo)")
 if "forecast_response" not in st.session_state:
     st.session_state["forecast_response"] = None
 
+# Mise à jour des options : seulement "Enregistrement par micro" et "Manuelle"
 tab1, tab2, tab3 = st.tabs(["Prévisions", "Analyse & Monitoring", "Feedback"])
 
 with tab1:
     st.header("Bienvenue sur l'application météo")
-    mode = st.radio("Sélectionnez le mode de commande :", ("Enregistrement par micro", "Charger un fichier audio", "Manuelle"))
+    mode = st.radio("Sélectionnez le mode de commande :", ("Enregistrement par micro", "Manuelle"))
     transcription_input = ""
     city_input = ""
     forecast_days_input = None
-    audio_bytes = None
 
-    if mode != "Enregistrement par micro":
-        forecast_days_input = st.selectbox("Nombre de jours de prévision", options=[3, 5, 7], index=2)
-    
     if mode == "Enregistrement par micro":
         st.subheader("Commande vocale via microphone")
         if st.button("Enregistrer la commande vocale"):
@@ -391,41 +392,31 @@ with tab1:
                     st.success(f"Prévision pour {result['location']} (commande vocale)")
                 else:
                     st.error(f"Erreur (code {response.status_code}) lors de l'envoi de la commande vocale")
-    elif mode == "Charger un fichier audio":
-        st.subheader("Chargement d'un fichier audio")
-        uploaded_file = st.file_uploader("Sélectionnez votre fichier audio", type=["wav", "mp3"])
-        if uploaded_file is not None:
-            audio_bytes = uploaded_file.getvalue()
-            st.audio(audio_bytes, format="audio/wav")
-        transcription_input = st.text_input("Transcription (facultatif)")
-        city_input = st.text_input("Ville (facultatif)")
     else:
         st.subheader("Commande manuelle")
         city_input = st.text_input("Ville")
-    
-    if mode != "Enregistrement par micro" and st.button("Envoyer la commande"):
-        backend_url = "http://localhost:8000/process_command"
-        files = {}
-        data = {}
-        if audio_bytes is not None:
-            files["file"] = ("audio.wav", audio_bytes, "audio/wav")
-        if transcription_input:
-            data["transcription"] = transcription_input
-        if city_input:
-            data["city"] = city_input
-        if forecast_days_input is not None:
-            data["forecast_days"] = str(forecast_days_input)
-        data["mode"] = "manuel"
-        try:
-            response = requests.post(backend_url, files=files, data=data)
-            if response.status_code == 200:
-                result = response.json()
-                st.success(f"Prévision pour {result['location']}")
-                st.session_state.forecast_response = result
-            else:
-                st.error(f"Erreur (code {response.status_code}) lors de l'envoi de la commande")
-        except Exception as e:
-            st.error("Impossible de joindre le backend. Vérifiez qu'il est démarré et accessible.")
+        forecast_days_input = st.selectbox("Nombre de jours de prévision", options=[3, 5, 7], index=2)
+        transcription_input = st.text_input("Saisissez votre commande (ex : prévisions pour 3 jours)")
+        if st.button("Envoyer la commande"):
+            backend_url = "http://localhost:8000/process_command"
+            data = {}
+            if transcription_input:
+                data["transcription"] = transcription_input
+            if city_input:
+                data["city"] = city_input
+            if forecast_days_input is not None:
+                data["forecast_days"] = str(forecast_days_input)
+            data["mode"] = "manuel"
+            try:
+                response = requests.post(backend_url, data=data)
+                if response.status_code == 200:
+                    result = response.json()
+                    st.success(f"Prévision pour {result['location']}")
+                    st.session_state.forecast_response = result
+                else:
+                    st.error(f"Erreur (code {response.status_code}) lors de l'envoi de la commande")
+            except Exception as e:
+                st.error("Impossible de joindre le backend. Vérifiez qu'il est démarré et accessible.")
     
     if st.session_state.forecast_response and st.button("Afficher les résultats"):
         result = st.session_state.forecast_response
@@ -434,6 +425,7 @@ with tab1:
         df = pd.DataFrame(result["forecast"]["hourly"])
         df['date'] = pd.to_datetime(df['date'])
         df['hour'] = df['date'].dt.hour
+        # Filtrer pour n'afficher que la prévision à 12h sur le nombre de jours demandé
         df_filtered = df[df['hour'] == 12].sort_values(by='date').head(final_days)
         
         fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08,
@@ -485,9 +477,49 @@ with tab2:
         metrics_url = "http://localhost:8000/metrics"
         metrics_response = requests.get(metrics_url)
         if metrics_response.status_code == 200:
-            st.subheader("Métriques Prometheus")
             lines = metrics_response.text.splitlines()
-            st.text("\n".join(lines))
+            metrics_list = []
+            for line in lines:
+                if line.startswith("#") or line.strip() == "":
+                    continue
+                parts = line.split()
+                if len(parts) >= 2:
+                    metric_name = parts[0]
+                    metric_value = parts[1]
+                    metrics_list.append({"Metric": metric_name, "Value": metric_value})
+            # Liste des 10 métriques les plus pertinentes
+            relevant_metric_names = [
+                "http_requests_total",
+                "http_request_duration_seconds",
+                "forecast_requests_total",
+                "errors_total",
+                "feedback_total",
+                "process_cpu_seconds_total",
+                "process_start_time_seconds",
+                "process_resident_memory_bytes",
+                "python_gc_objects_collected_total",
+                "python_gc_objects_uncollectable_total"
+            ]
+            filtered_metrics = [m for m in metrics_list if m["Metric"] in relevant_metric_names]
+            df_metrics = pd.DataFrame(filtered_metrics)
+            st.subheader("Métriques Prometheus")
+            st.dataframe(df_metrics)
+            
+            definitions = {
+                "http_requests_total": "Nombre total de requêtes HTTP, ventilées par méthode, endpoint et code HTTP.",
+                "http_request_duration_seconds": "Durée des requêtes HTTP (en secondes) par méthode et endpoint.",
+                "forecast_requests_total": "Nombre total de demandes de prévisions traitées.",
+                "errors_total": "Nombre total d'erreurs survenues lors du traitement des requêtes.",
+                "feedback_total": "Nombre total de retours utilisateurs enregistrés.",
+                "process_cpu_seconds_total": "Temps CPU utilisé par le processus.",
+                "process_start_time_seconds": "Heure de démarrage du processus.",
+                "process_resident_memory_bytes": "Mémoire résidente utilisée par le processus (en octets).",
+                "python_gc_objects_collected_total": "Nombre total d'objets collectés par le ramasse-miettes Python.",
+                "python_gc_objects_uncollectable_total": "Nombre total d'objets non collectables par le ramasse-miettes Python."
+            }
+            st.markdown("### Définitions des métriques")
+            for metric, definition in definitions.items():
+                st.markdown(f"- **{metric}** : {definition}")
         else:
             st.error("Erreur lors de la récupération des métriques Prometheus.")
     except Exception as e:
