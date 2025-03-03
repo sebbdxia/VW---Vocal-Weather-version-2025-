@@ -16,6 +16,7 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Response, Re
 from pydantic import BaseModel
 
 import streamlit as st
+import streamlit.components.v1 as components
 import requests_cache
 import pandas as pd
 from retry_requests import retry
@@ -58,7 +59,6 @@ retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 nlp = spacy.load("fr_core_news_sm")
-logs = []
 user_feedbacks = []
 
 # Middleware Prometheus
@@ -116,6 +116,7 @@ async def process_command(
         
         hourly_dataframe = get_weather_forecast(final_city)
         mode_used = "vocale" if file is not None or (transcription_text and forecast_days is None) else "manuel"
+        # Stockage persistant des logs dans Azure
         store_forecast_in_db(transcription_text, final_city, final_forecast_days, hourly_dataframe, mode_used)
         FORECAST_REQUESTS.inc()
         forecast_data = hourly_dataframe.to_dict(orient="records")
@@ -135,7 +136,32 @@ async def process_command(
 
 @app.get("/analysis")
 def analysis():
-    return {"total_requests": len(logs), "logs": logs, "feedbacks": user_feedbacks}
+    try:
+        import psycopg2
+        conn = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT timestamp, transcription, city, forecast_days, forecast, mode 
+            FROM forecasts
+            ORDER BY timestamp DESC
+        """)
+        rows = cur.fetchall()
+        logs_db = []
+        for row in rows:
+            logs_db.append({
+                "timestamp": row[0],
+                "transcription": row[1],
+                "city": row[2],
+                "forecast_days": row[3],
+                "forecast": row[4],
+                "mode": row[5]
+            })
+        cur.close()
+        conn.close()
+        return {"total_requests": len(logs_db), "logs": logs_db, "feedbacks": user_feedbacks}
+    except Exception as e:
+        logging.error("Erreur lors de la récupération des logs depuis Azure", exc_info=True)
+        raise HTTPException(status_code=500, detail="Erreur lors de la récupération des logs")
 
 @app.get("/metrics")
 def metrics():
@@ -148,11 +174,19 @@ def metrics():
 
 @app.get("/top_cities")
 def top_cities():
-    city_counts = {}
-    for entry in logs:
-        city = entry.get("city", "Inconnu")
-        city_counts[city] = city_counts.get(city, 0) + 1
-    return city_counts
+    try:
+        import psycopg2
+        conn = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST)
+        cur = conn.cursor()
+        cur.execute("SELECT city, COUNT(*) FROM forecasts GROUP BY city")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        city_counts = {row[0]: row[1] for row in rows}
+        return city_counts
+    except Exception as e:
+        logging.error("Erreur lors de la récupération des données de villes depuis Azure", exc_info=True)
+        raise HTTPException(status_code=500, detail="Erreur lors de la récupération des données")
 
 @app.get("/feedbacks")
 def get_feedbacks():
@@ -222,7 +256,6 @@ def azure_speech_from_microphone() -> str:
     
     speech_config = speechsdk.SpeechConfig(subscription=SPEECH_KEY, region=SPEECH_REGION)
     speech_config.speech_recognition_language = "fr-FR"
-    # Reconnaissance continue pour une meilleure qualité de transcription
     audio_config = speechsdk.audio.AudioConfig(use_default_microphone=True)
     speech_recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
     st.info("Veuillez parler... (enregistrement continu pendant 10 secondes)")
@@ -251,7 +284,6 @@ def spacy_analyze(text: str) -> Tuple[str, int]:
     doc = nlp(text)
     location = None
     forecast_days = None
-    # Recherche des motifs "sur X jours" ou "pour X jours"
     regex_match = re.search(r"(?:sur|pour)\s+(\d+)\s+jours", text, re.IGNORECASE)
     if regex_match:
         try:
@@ -319,7 +351,6 @@ def store_forecast_in_db(transcription: str, location: str, forecast_days: int, 
         "forecast": forecast_df.to_dict(orient="records"),
         "mode": mode
     }
-    logs.append(entry)
     try:
         import psycopg2
         conn = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST)
@@ -338,7 +369,14 @@ def store_forecast_in_db(transcription: str, location: str, forecast_days: int, 
         cur.execute("""
             INSERT INTO forecasts (timestamp, transcription, city, forecast_days, forecast, mode)
             VALUES (%s, %s, %s, %s, %s, %s)
-        """, (entry["timestamp"], entry["transcription"], entry["city"], entry["forecast_days"], json.dumps(entry["forecast"]), entry["mode"]))
+        """, (
+            entry["timestamp"],
+            entry["transcription"],
+            entry["city"],
+            entry["forecast_days"],
+            json.dumps(entry["forecast"], default=str),
+            entry["mode"]
+        ))
         conn.commit()
         cur.close()
         conn.close()
@@ -353,13 +391,11 @@ if "backend_started" not in st.session_state:
     threading.Thread(target=run_backend, daemon=True).start()
     time.sleep(1)
 
-# Interface Streamlit
 st.title("Application Météo – Commande vocale et manuelle (Open-Meteo)")
 
 if "forecast_response" not in st.session_state:
     st.session_state["forecast_response"] = None
 
-# Mise à jour des options : seulement "Enregistrement par micro" et "Manuelle"
 tab1, tab2, tab3 = st.tabs(["Prévisions", "Analyse & Monitoring", "Feedback"])
 
 with tab1:
@@ -425,7 +461,6 @@ with tab1:
         df = pd.DataFrame(result["forecast"]["hourly"])
         df['date'] = pd.to_datetime(df['date'])
         df['hour'] = df['date'].dt.hour
-        # Filtrer pour n'afficher que la prévision à 12h sur le nombre de jours demandé
         df_filtered = df[df['hour'] == 12].sort_values(by='date').head(final_days)
         
         fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08,
@@ -487,7 +522,6 @@ with tab2:
                     metric_name = parts[0]
                     metric_value = parts[1]
                     metrics_list.append({"Metric": metric_name, "Value": metric_value})
-            # Liste des 10 métriques les plus pertinentes
             relevant_metric_names = [
                 "http_requests_total",
                 "http_request_duration_seconds",
@@ -506,16 +540,9 @@ with tab2:
             st.dataframe(df_metrics)
             
             definitions = {
-                "http_requests_total": "Nombre total de requêtes HTTP, ventilées par méthode, endpoint et code HTTP.",
-                "http_request_duration_seconds": "Durée des requêtes HTTP (en secondes) par méthode et endpoint.",
                 "forecast_requests_total": "Nombre total de demandes de prévisions traitées.",
                 "errors_total": "Nombre total d'erreurs survenues lors du traitement des requêtes.",
                 "feedback_total": "Nombre total de retours utilisateurs enregistrés.",
-                "process_cpu_seconds_total": "Temps CPU utilisé par le processus.",
-                "process_start_time_seconds": "Heure de démarrage du processus.",
-                "process_resident_memory_bytes": "Mémoire résidente utilisée par le processus (en octets).",
-                "python_gc_objects_collected_total": "Nombre total d'objets collectés par le ramasse-miettes Python.",
-                "python_gc_objects_uncollectable_total": "Nombre total d'objets non collectables par le ramasse-miettes Python."
             }
             st.markdown("### Définitions des métriques")
             for metric, definition in definitions.items():
