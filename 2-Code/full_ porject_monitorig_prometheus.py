@@ -60,7 +60,7 @@ prom_registry.register(GC_COLLECTOR)
 cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
 retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
 
-# Initialisation de FastAPI et du modèle NLP (la version full_projet est privilégiée)
+# Initialisation de FastAPI et du modèle NLP
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 nlp = spacy.load("fr_core_news_sm")
@@ -96,7 +96,7 @@ class WeatherResponse(BaseModel):
     transcription: Optional[str] = None
     mode: Optional[str] = None
 
-# Analyse du texte à l'aide de Spacy (version full_projet privilégiée)
+# Analyse du texte à l'aide de Spacy
 def spacy_analyze(text: str) -> Tuple[str, int]:
     doc = nlp(text)
     city = None
@@ -110,7 +110,7 @@ def spacy_analyze(text: str) -> Tuple[str, int]:
                 days = int(match.group())
     return city, days
 
-# Fonctions complémentaires issues de la version corrected-weather-app pour améliorer la récupération des prévisions
+# Fonctions pour récupérer les prévisions météo
 def get_coordinates(city_name: str) -> Tuple[float, float]:
     try:
         geocode_url = "https://nominatim.openstreetmap.org/search"
@@ -203,7 +203,7 @@ def store_forecast_in_db(transcription: str, location: str, forecast_days: int, 
     except Exception as e:
         logging.error(f"Erreur lors du stockage en base de données : {str(e)}", exc_info=True)
 
-# Fonction de transcription depuis un fichier audio (préférant la version full_projet)
+# Fonction de transcription depuis un fichier audio
 def azure_speech_to_text(audio_bytes: bytes) -> str:
     import azure.cognitiveservices.speech as speechsdk
     if not SPEECH_KEY or not SPEECH_REGION:
@@ -228,7 +228,7 @@ def azure_speech_to_text(audio_bytes: bytes) -> str:
         logging.error(f"Erreur de transcription: {result.reason}")
         return ""
 
-# Fonction complémentaire pour la commande vocale depuis le micro (issue de corrected-weather-app)
+# Fonction complémentaire pour la commande vocale depuis le micro
 def azure_speech_from_microphone() -> str:
     try:
         import azure.cognitiveservices.speech as speechsdk
@@ -302,36 +302,6 @@ async def process_command(
         logging.error("Erreur lors du traitement de la commande", exc_info=True)
         raise HTTPException(status_code=500, detail="Erreur lors du traitement de la commande")
 
-# Endpoint pour récupérer les logs et retours
-@app.get("/analysis")
-def analysis():
-    try:
-        import psycopg2
-        conn = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST)
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT timestamp, transcription, city, forecast_days, forecast, mode 
-            FROM forecasts
-            ORDER BY timestamp DESC
-        """)
-        rows = cur.fetchall()
-        logs_db = []
-        for row in rows:
-            logs_db.append({
-                "timestamp": row[0],
-                "transcription": row[1],
-                "city": row[2],
-                "forecast_days": row[3],
-                "forecast": row[4],
-                "mode": row[5]
-            })
-        cur.close()
-        conn.close()
-        return {"total_requests": len(logs_db), "logs": logs_db, "feedbacks": user_feedbacks}
-    except Exception as e:
-        logging.error("Erreur lors de la récupération des logs depuis Azure", exc_info=True)
-        raise HTTPException(status_code=500, detail="Erreur lors de la récupération des logs")
-
 # Endpoint d'exposition des métriques Prometheus
 @app.get("/metrics")
 def metrics():
@@ -341,81 +311,6 @@ def metrics():
     except Exception as e:
         logging.error("Erreur lors de l'exposition des métriques", exc_info=True)
         raise HTTPException(status_code=500, detail="Erreur lors de l'exposition des métriques")
-
-# Endpoint pour obtenir le nombre de demandes par ville
-@app.get("/top_cities")
-def top_cities():
-    try:
-        import psycopg2
-        conn = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST)
-        cur = conn.cursor()
-        cur.execute("SELECT city, COUNT(*) FROM forecasts GROUP BY city")
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        city_counts = {row[0]: row[1] for row in rows}
-        return city_counts
-    except Exception as e:
-        logging.error("Erreur lors de la récupération des données de villes depuis Azure", exc_info=True)
-        raise HTTPException(status_code=500, detail="Erreur lors de la récupération des données")
-
-# Endpoints pour les retours utilisateurs
-@app.get("/feedbacks")
-def get_feedbacks():
-    try:
-        import psycopg2
-        conn = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST)
-        cur = conn.cursor()
-        cur.execute("SELECT timestamp, rating, comment FROM feedback ORDER BY timestamp DESC")
-        rows = cur.fetchall()
-        feedbacks = []
-        for row in rows:
-            feedbacks.append({
-                "timestamp": row[0].isoformat() if isinstance(row[0], datetime.datetime) else row[0],
-                "rating": row[1],
-                "comment": row[2]
-            })
-        cur.close()
-        conn.close()
-        return feedbacks
-    except Exception as e:
-        logging.error("Erreur lors de la récupération des feedbacks: " + str(e), exc_info=True)
-        return user_feedbacks
-
-@app.post("/feedback")
-def feedback(rating: int = Form(...), comment: str = Form("")):
-    if not 1 <= rating <= 5:
-        raise HTTPException(status_code=400, detail="La note doit être comprise entre 1 et 5")
-    entry = {
-        "timestamp": datetime.datetime.now().isoformat(),
-        "rating": rating,
-        "comment": comment
-    }
-    user_feedbacks.append(entry)
-    FEEDBACK_COUNT.inc()
-    try:
-        import psycopg2
-        conn = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST)
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS feedback (
-                id SERIAL PRIMARY KEY,
-                timestamp TIMESTAMPTZ,
-                rating INTEGER,
-                comment TEXT
-            );
-        """)
-        cur.execute("""
-            INSERT INTO feedback (timestamp, rating, comment)
-            VALUES (%s, %s, %s)
-        """, (datetime.datetime.now(), entry["rating"], entry["comment"]))
-        conn.commit()
-        cur.close()
-        conn.close()
-        return {"status": "Feedback enregistré avec succès"}
-    except Exception as e:
-        logging.error(f"Erreur lors du stockage du feedback PostgreSQL: {e}", exc_info=True)
-        return {"status": "Feedback enregistré en mémoire uniquement", "error": str(e)}
 
 # Fonctions d'encodage pour générer l'URL PlantUML
 import zlib
@@ -511,11 +406,46 @@ def run_backend():
     except Exception as e:
         logging.error(f"Erreur lors du démarrage du backend: {str(e)}", exc_info=True)
 
+# Fonction pour parser les métriques Prometheus et extraire 5 métriques pertinentes
+def parse_metric_value(metrics_text: str, metric_name: str) -> float:
+    total = 0.0
+    for line in metrics_text.splitlines():
+        if line.startswith(metric_name):
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    total += float(parts[-1])
+                except:
+                    pass
+    return total
+
+def compute_avg_latency(metrics_text: str) -> float:
+    sum_val = None
+    count_val = None
+    for line in metrics_text.splitlines():
+        if line.startswith("http_request_duration_seconds_sum"):
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    sum_val = float(parts[-1])
+                except:
+                    pass
+        if line.startswith("http_request_duration_seconds_count"):
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    count_val = float(parts[-1])
+                except:
+                    pass
+    if sum_val is not None and count_val and count_val > 0:
+        return sum_val / count_val
+    return 0.0
+
 # Interface Streamlit
 st.title("Application Météo – Commande vocale et manuelle (Open-Meteo)")
 
-# Onglets pour naviguer entre les différentes fonctionnalités
-tab1, tab2, tab3, tab4 = st.tabs(["Prévisions", "Analyse & Monitoring", "Feedback", "Architecture"])
+# Définition des onglets : Prévisions, Metrics, Feedback et Architecture
+tab1, tab2, tab3, tab4 = st.tabs(["Prévisions", "Metrics", "Feedback", "Architecture"])
 
 with tab1:
     st.header("Bienvenue sur l'application météo")
@@ -576,41 +506,80 @@ with tab1:
                     st.error(f"Erreur (code {response.status_code}) lors de l'envoi de la commande")
             except Exception as e:
                 st.error(f"Impossible de joindre le backend. Vérifiez qu'il est démarré et accessible: {str(e)}")
-    if "forecast_response" in st.session_state and st.session_state.forecast_response:
-        if st.button("Afficher les résultats", key="display_results"):
-            try:
-                result = st.session_state.forecast_response
-                st.subheader("Prévisions")
-                final_days = result["forecast_days"]
-                df = pd.DataFrame(result["forecast"]["hourly"])
-                df['date'] = pd.to_datetime(df['date'])
-                df['hour'] = df['date'].dt.hour
-                df_filtered = df[df['hour'] == 12].sort_values(by='date').head(final_days)
-                fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08,
-                                    subplot_titles=("Température (°C)", "Nébulosité (%)", "Vent (km/h)"))
-                fig.add_trace(go.Scatter(x=df_filtered['date'], y=df_filtered['temperature_2m'],
-                                         mode='lines+markers', marker=dict(color='red')), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df_filtered['date'], y=df_filtered['cloudcover'],
-                                         mode='lines+markers', marker=dict(color='blue')), row=2, col=1)
-                fig.add_trace(go.Scatter(x=df_filtered['date'], y=df_filtered['windspeed_10m'],
-                                         mode='lines+markers', marker=dict(color='green')), row=3, col=1)
-                fig.update_layout(height=600, title=f"Prévisions de Midi sur {final_days} jours", showlegend=False)
-                st.plotly_chart(fig, use_container_width=True)
-            except Exception as e:
-                st.error(f"Erreur lors de l'affichage des résultats: {str(e)}")
+    
+    if st.session_state.get("forecast_response") and st.button("Afficher les résultats"):
+        result = st.session_state.forecast_response
+        st.subheader("Prévisions")
+        final_days = result["forecast_days"]
+        df = pd.DataFrame(result["forecast"]["hourly"])
+        df['date'] = pd.to_datetime(df['date'])
+        df['hour'] = df['date'].dt.hour
+        df_filtered = df[df['hour'] == 12].sort_values(by='date').head(final_days)
+        
+        fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                            subplot_titles=("Température (°C)", "Nébulosité (%)", "Vent (km/h)"))
+        fig.add_trace(go.Scatter(x=df_filtered['date'], y=df_filtered['temperature_2m'],
+                                 mode='lines+markers', marker=dict(color='red')), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_filtered['date'], y=df_filtered['cloudcover'],
+                                 mode='lines+markers', marker=dict(color='blue')), row=2, col=1)
+        fig.add_trace(go.Scatter(x=df_filtered['date'], y=df_filtered['windspeed_10m'],
+                                 mode='lines+markers', marker=dict(color='green')), row=3, col=1)
+        fig.update_layout(height=600, title=f"Prévisions de Midi sur {final_days} jours", showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        st.subheader("Détails des prévisions")
+        st.dataframe(df_filtered[['date', 'temperature_2m', 'cloudcover', 'windspeed_10m', 'pm2_5']].rename(
+            columns={
+                "date": "Date",
+                "temperature_2m": "Température (°C)",
+                "cloudcover": "Nébulosité (%)",
+                "windspeed_10m": "Vent (km/h)",
+                "pm2_5": "Pollution (µg/m³)"
+            }
+        ))
+        st.subheader("Localisation")
+        try:
+            lat, lon = get_coordinates(result["location"])
+            map_data = pd.DataFrame({"lat": [lat], "lon": [lon]})
+            st.map(map_data)
+        except Exception as e:
+            st.error(f"Impossible d'afficher la carte: {e}")
+        if result.get("transcription"):
+            st.write("Transcription utilisée :", result["transcription"])
 
 with tab2:
-    st.header("Logs et métriques")
+    st.header("Metrics Prometheus")
     try:
-        analysis_url = "http://localhost:8000/analysis"
-        metrics_url = "http://localhost:8000/metrics"
-        analysis_response = requests.get(analysis_url, timeout=30).json()
-        st.write("Total des requêtes:", analysis_response.get("total_requests"))
-        st.write("Logs:", analysis_response.get("logs"))
-        st.write("Feedbacks:", analysis_response.get("feedbacks"))
-        st.write("Métriques Prometheus:", requests.get(metrics_url, timeout=30).text)
+        metrics_text = requests.get("http://localhost:8000/metrics", timeout=30).text
+        total_requests = parse_metric_value(metrics_text, "http_requests_total")
+        avg_latency = compute_avg_latency(metrics_text)
+        forecast_requests = parse_metric_value(metrics_text, "forecast_requests_total")
+        errors_total = parse_metric_value(metrics_text, "errors_total")
+        feedback_total = parse_metric_value(metrics_text, "feedback_total")
+        col1, col2, col3, col4, col5 = st.columns(5)
+        col1.metric("HTTP Requests", f"{total_requests:.0f}")
+        col2.metric("Avg Latency (s)", f"{avg_latency:.3f}")
+        col3.metric("Forecast Requests", f"{forecast_requests:.0f}")
+        col4.metric("Errors", f"{errors_total:.0f}")
+        col5.metric("Feedbacks", f"{feedback_total:.0f}")
     except Exception as e:
-        st.error(f"Erreur lors de la récupération des données: {str(e)}")
+        st.error(f"Erreur lors de la récupération des metrics : {str(e)}")
+    
+    try:
+        top_cities_url = "http://localhost:8000/top_cities"
+        response = requests.get(top_cities_url)
+        if response.status_code == 200:
+            st.subheader("Répartition des demandes par ville")
+            top_cities_data = response.json()
+            df_top = pd.DataFrame(list(top_cities_data.items()), columns=["Ville", "Nombre de demandes"])
+            st.dataframe(df_top)
+            fig = go.Figure(data=[go.Bar(x=df_top["Ville"], y=df_top["Nombre de demandes"], marker_color='indianred')])
+            fig.update_layout(title="Nombre de demandes par ville", xaxis_title="Ville", yaxis_title="Nombre de demandes", template="plotly_white")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.error("Erreur lors de la récupération des données par ville.")
+    except Exception as e:
+        st.error("Impossible de joindre l'endpoint /top_cities.")
 
 with tab3:
     st.header("Feedback")
@@ -633,7 +602,6 @@ with tab4:
         diagram_response = requests.get("http://localhost:8000/diagram", timeout=30).json()
         diagram_url = diagram_response.get("diagram_url")
         if diagram_url:
-            # Affichage via du HTML pour contourner le problème d'importation de PIL.imaging
             st.markdown(f"<img src='{diagram_url}' alt='Architecture fonctionnelle' style='width:100%;' />", unsafe_allow_html=True)
         else:
             st.error("Schéma non disponible")
