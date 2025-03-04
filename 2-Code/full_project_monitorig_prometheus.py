@@ -399,6 +399,46 @@ def get_diagram():
         logging.error("Erreur lors de la génération du schéma fonctionnel", exc_info=True)
         raise HTTPException(status_code=500, detail="Erreur lors de la génération du schéma fonctionnel")
 
+def get_top_cities() -> Dict[str, int]:
+    try:
+        import psycopg2
+        conn = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT city, COUNT(*) as count
+            FROM forecasts
+            GROUP BY city
+            ORDER BY count DESC
+            LIMIT 10;
+        """)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return {row[0]: row[1] for row in rows}
+    except Exception as e:
+        logging.error(f"Erreur lors de la récupération des villes les plus demandées : {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Erreur lors de la récupération des villes les plus demandées")
+
+@app.get("/top_cities")
+def top_cities():
+    try:
+        top_cities_data = get_top_cities()
+        return top_cities_data
+    except Exception as e:
+        logging.error(f"Erreur lors de la récupération des villes les plus demandées : {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Erreur lors de la récupération des villes les plus demandées")
+
+# Endpoint pour enregistrer les feedbacks des utilisateurs
+@app.post("/feedback")
+def feedback(rating: int = Form(...), comment: str = Form(...)):
+    try:
+        user_feedbacks.append({"rating": rating, "comment": comment})
+        FEEDBACK_COUNT.inc()
+        return {"message": "Feedback enregistré"}
+    except Exception as e:
+        logging.error(f"Erreur lors de l'enregistrement du feedback : {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Erreur lors de l'enregistrement du feedback")
+
 # Fonction pour lancer le backend
 def run_backend():
     try:
